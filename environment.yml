@@ -1,0 +1,25 @@
+name: aletheia
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - numpy
+  - scikit-learn
+  - pandas
+  - pyarrow
+  - tqdm
+  - requests
+  - pip
+  - pip:
+    - qdrant-client
+    - sentence-transformers
+    - trafilatura
+    - readability-lxml
+    - fasttext-wheel
+    - hdbscan
+    - umap-learn
+    - openai
+    - datasketch
+    - simhash
+    - playwright

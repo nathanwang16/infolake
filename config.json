@@ -1,0 +1,103 @@
+{
+    "paths": {
+        "data_dir": "./data",
+        "logs_dir": "./logs",
+        "dumps_dir": "./dataset",
+        "archive_dir": "./data/archive",
+        "parsed_archive_dir": "./data/parsed_archive",
+        "golden_set_path": "./data/golden_set.db",
+        "exports_dir": "./data/exports",
+        "mappings_dir": "./data/mappings"
+    },
+    "database": {
+        "sqlite_path": "./data/atlas.db"
+    },
+    "qdrant": {
+        "url": "http://localhost:6333",
+        "collection": "atlas_embeddings",
+        "quantization": "scalar",
+        "on_disk": true
+    },
+    "embedding": {
+        "model": "BAAI/bge-small-en-v1.5",
+        "device": "mps",
+        "batch_size": 32,
+        "max_tokens": 512
+    },
+    "batch_processing": {
+        "default_dump": "./dataset/sample-test-50.tar",
+        "workers": 8,
+        "worker_batch_size": 32,
+        "quality_weight_alpha": 1.0,
+        "novelty_threshold": 0.08,
+        "quality_threshold": 0.3,
+        "url_queue_size": 5000,
+        "embed_queue_size": 2000,
+        "lazy_greedy": true,
+        "expected_documents": 100000,
+        "limit": 0
+    },
+    "content_extraction": {
+        "extractor": "trafilatura",
+        "fallback": "readability",
+        "store_raw_html_hash": true,
+        "min_length": 100,
+        "max_length": 100000
+    },
+    "language": {
+        "target": "en",
+        "use_langdetect": true
+    },
+    "exploration": {
+        "topic_gaps": {
+            "method": "lonely_nodes",
+            "samples": 1000,
+            "threshold": 0.20,
+            "num_gaps": 10
+        },
+        "viewpoint_gaps": {
+            "num_gaps": 5,
+            "diversity_threshold": 0.3
+        },
+        "query_synthesis": {
+            "method": "llm",
+            "queries_per_gap": 5
+        },
+        "cycle_interval_hours": 6
+    },
+    "calibration": {
+        "current_version": 1,
+        "holdout_fraction": 0.2,
+        "csv_path": "data/golden_set_sample.csv",
+        "default_content_type": "technical_code"
+    },
+    "deduplication": {
+        "simhash_threshold": 3,
+        "minhash_jaccard_threshold": 0.5,
+        "embedding_similarity_threshold": 0.95
+    },
+    "mapping": {
+        "input_source": "qdrant",
+        "output_format": "json",
+        "output_path": "./data/mappings/latest.json",
+        "umap": {
+            "neighbors": 15,
+            "min_dist": 0.1,
+            "metric": "cosine"
+        },
+        "hdbscan": {
+            "min_cluster_size": 5
+        },
+        "sample_for_fit": 100000
+    },
+    "visualizer": {
+        "host": "localhost",
+        "port": 8080,
+        "static_dir": "./visualizer/static"
+    },
+    "monitor": {
+        "gini_alert_threshold": 0.6,
+        "orphan_review_threshold": 100,
+        "drift_alert_delta": 0.05
+    }
+}

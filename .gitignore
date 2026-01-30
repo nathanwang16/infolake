@@ -1,0 +1,86 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.out-of-code-insights/
+
+# macOS
+.DS_Store
+*.DS_Store
+
+# Database files
+data/atlas.db
+data/atlas.db-journal
+data/atlas.db-wal
+data/atlas.db-shm
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Logs (keep directory structure)
+logs/*.jsonl
+
+# Generated data (keep directory structure)
+data/mappings/*.json
+data/parsed_archive/
+data/exports/
+
+# Test datasets (large files)
+dataset/*.tar
+dataset/*.tar.gz
+!dataset/sample_test_dataset.py
+
+# Qdrant data (if running locally)
+qdrant_data/
+.qdrant/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+
+# mypy
+.mypy_cache/
+
+# pytest
+.pytest_cache/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
