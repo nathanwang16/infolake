@@ -1,4 +1,4 @@
-name: aletheia
+name: infolake
 channels:
   - conda-forge
   - defaults
@@ -10,16 +10,32 @@ dependencies:
   - pyarrow
   - tqdm
   - requests
+  - zstandard
   - pip
   - pip:
+    # Vector storage and embedding
     - qdrant-client
     - sentence-transformers
+    
+    # Content extraction
     - trafilatura
     - readability-lxml
-    - fasttext-wheel
+    - langdetect
+    
+    # Mapping and clustering
     - hdbscan
     - umap-learn
-    - openai
+    
+    # Deduplication
     - datasketch
     - simhash
+    
+    # Language detection (alternative)
+    - fasttext-wheel
+    
+    # Crawling (optional, for advanced fetching)
     - playwright
+    - curl_cffi
+    
+    # LLM integration (optional, for query synthesis)
+    - openai
