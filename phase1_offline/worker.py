@@ -388,27 +388,35 @@ class BatchWorker(threading.Thread):
         self._stats['processed'] += 1
         url = item.url
         
-        # 1. Fetch HTML (or use pre-fetched)
-        if item.html:
-            html = item.html
+        # Check if text is pre-extracted (e.g., C4 dataset)
+        if item.metadata and item.metadata.get('pre_extracted') and item.metadata.get('text'):
+            text = item.metadata['text']
+            raw_hash = hashlib.sha256(text.encode('utf-8', errors='ignore')).hexdigest()
+            metadata = {'url': url, 'title': None}
+            if item.metadata:
+                metadata.update(item.metadata)
         else:
-            html = self._fetch(url)
-            if not html:
-                self._stats['fetch_errors'] += 1
+            # 1. Fetch HTML (or use pre-fetched)
+            if item.html:
+                html = item.html
+            else:
+                html = self._fetch(url)
+                if not html:
+                    self._stats['fetch_errors'] += 1
+                    return
+            
+            # 2. Compute raw HTML hash
+            raw_hash = hashlib.sha256(html.encode('utf-8', errors='ignore')).hexdigest()
+            
+            # 3. Extract text
+            text, metadata = self.extractor.extract(html, url)
+            if not text:
+                self._stats['extract_errors'] += 1
                 return
-        
-        # 2. Compute raw HTML hash
-        raw_hash = hashlib.sha256(html.encode('utf-8', errors='ignore')).hexdigest()
-        
-        # 3. Extract text
-        text, metadata = self.extractor.extract(html, url)
-        if not text:
-            self._stats['extract_errors'] += 1
-            return
-        
-        # Merge item metadata
-        if item.metadata:
-            metadata.update(item.metadata)
+            
+            # Merge item metadata
+            if item.metadata:
+                metadata.update(item.metadata)
         
         # 4. Language filter
         if not self.language_detector.is_target_language(text):

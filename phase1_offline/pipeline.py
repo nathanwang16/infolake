@@ -153,12 +153,15 @@ class BatchPipeline:
         num_workers: Optional[int] = None,
         limit: int = 0,
         url_queue_size: Optional[int] = None,
-        embed_queue_size: Optional[int] = None
+        embed_queue_size: Optional[int] = None,
+        additional_dumps: Optional[List[str]] = None
     ):
         if dump_path is None:
             raise ValueError("dump_path is required")
         
         self.dump_path = Path(dump_path)
+        self.additional_dumps = additional_dumps or []
+        self.all_dump_paths = [str(self.dump_path)] + self.additional_dumps
         self.num_workers = num_workers or config.get("batch_processing.workers", 4)
         self.limit = limit
         
@@ -179,7 +182,7 @@ class BatchPipeline:
         self._stats = PipelineStats(start_time=time.time())
         self._writer_thread = None
         
-        logger.info(f"Pipeline initialized: dump={dump_path}, workers={self.num_workers}, limit={limit}")
+        logger.info(f"Pipeline initialized: dumps={self.all_dump_paths}, workers={self.num_workers}, limit={limit}")
     
     def setup(self):
         """Initializes all pipeline components."""
@@ -189,12 +192,20 @@ class BatchPipeline:
         self.url_queue = Queue(maxsize=self.url_queue_size)
         self.embed_queue = Queue(maxsize=self.embed_queue_size)
         
-        # Create producer
-        self.producer = Producer(
-            url_queue=self.url_queue,
-            dump_path=str(self.dump_path),
-            limit=self.limit
-        )
+        # Create producer (use MultiProducer if multiple dumps)
+        if len(self.all_dump_paths) > 1:
+            logger.info(f"Using MultiProducer for {len(self.all_dump_paths)} dumps")
+            self.producer = MultiProducer(
+                url_queue=self.url_queue,
+                dump_paths=self.all_dump_paths,
+                total_limit=self.limit
+            )
+        else:
+            self.producer = Producer(
+                url_queue=self.url_queue,
+                dump_path=str(self.dump_path),
+                limit=self.limit
+            )
         
         # Create worker pool
         self.worker_pool = WorkerPool(

@@ -43,8 +43,8 @@ def main():
     # All params default to config.json values
     parser.add_argument(
         "--dump",
-        default=config.get("batch_processing.default_dump"),
-        help=f"Dump file path (default: {config.get('batch_processing.default_dump')})"
+        action="append",
+        help="Dump file/directory path (can specify multiple times)"
     )
     parser.add_argument(
         "--workers",
@@ -73,13 +73,24 @@ def main():
     
     args = parser.parse_args()
     
-    # Validate
-    if not args.dump:
-        parser.error("No dump file specified. Set batch_processing.default_dump in config.json or use --dump")
+    # Collect dump paths
+    dump_paths = args.dump if args.dump else []
     
-    dump_path = Path(args.dump)
-    if not dump_path.exists():
-        parser.error(f"Dump file not found: {dump_path}")
+    # Add default dump if none specified
+    if not dump_paths:
+        default_dump = config.get("batch_processing.default_dump")
+        if default_dump:
+            dump_paths = [default_dump]
+        else:
+            parser.error("No dump file specified. Set batch_processing.default_dump in config.json or use --dump")
+    
+    # Validate all paths exist
+    validated_paths = []
+    for dump in dump_paths:
+        dump_path = Path(dump)
+        if not dump_path.exists():
+            parser.error(f"Dump file/directory not found: {dump_path}")
+        validated_paths.append(str(dump_path))
     
     # Setup logging
     setup_logger("batch_process", console_output=True)
@@ -87,18 +98,20 @@ def main():
     logger.info("=" * 60)
     logger.info("PHASE 1: BATCH PROCESSING")
     logger.info("=" * 60)
-    logger.info(f"Dump: {args.dump}")
+    for i, p in enumerate(validated_paths):
+        logger.info(f"Dump {i+1}: {p}")
     logger.info(f"Workers: {args.workers}")
     logger.info(f"Limit: {args.limit if args.limit > 0 else 'None'}")
     logger.info("=" * 60)
     
-    # Run pipeline
+    # Run pipeline (use first dump for now, MultiProducer support in pipeline)
     pipeline = BatchPipeline(
-        dump_path=str(dump_path),
+        dump_path=validated_paths[0],
         num_workers=args.workers,
         limit=args.limit,
         url_queue_size=args.url_queue_size,
-        embed_queue_size=args.embed_queue_size
+        embed_queue_size=args.embed_queue_size,
+        additional_dumps=validated_paths[1:] if len(validated_paths) > 1 else None
     )
     
     stats = pipeline.run()

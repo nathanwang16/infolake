@@ -39,3 +39,4 @@ dependencies:
     
     # LLM integration (optional, for query synthesis)
     - openai
+

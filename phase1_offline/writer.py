@@ -32,6 +32,8 @@ import numpy as np
 from src.logging.logger import get_logger
 from common.config import config
 from common.database import db
+from common.text_utils import extract_excerpt
+from common.summarizer import summarize_content
 from curation.scoring import scorer
 from phase1_offline.fps_sampler import FarthestPointSampler
 from phase1_offline.deduplication import Deduplicator, compute_content_hash
@@ -422,18 +424,24 @@ class Writer:
     ):
         """Saves document to SQLite database."""
         try:
+            # Generate concise summary using LLM/ML model (falls back to excerpt)
+            summary = summarize_content(text, max_length=80)
+            if not summary:
+                summary = extract_excerpt(text, max_words=80, prefer_first_paragraph=True)
+            
             cursor = self.conn.cursor()
             cursor.execute("""
                 INSERT OR IGNORE INTO documents 
-                (id, canonical_url, title, content_hash, domain, 
+                (id, canonical_url, title, summary, content_hash, domain, 
                  detected_content_type, quality_score, quality_components,
                  quality_profile_used, raw_html_hash, novelty_distance,
                  source_phase, content_length, created_at, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'active')
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'active')
             """, (
                 doc_id,
                 url,
                 metadata.get('title', ''),
+                summary,
                 hashlib.md5(text.encode()).hexdigest(),
                 self._get_domain(url),
                 content_type,
@@ -544,17 +552,23 @@ class BatchWriter(Writer):
             cursor = self.conn.cursor()
             
             for kwargs in self._db_buffer:
+                # Generate concise summary using LLM/ML model (falls back to excerpt)
+                summary = summarize_content(kwargs['text'], max_length=80)
+                if not summary:
+                    summary = extract_excerpt(kwargs['text'], max_words=80, prefer_first_paragraph=True)
+                
                 cursor.execute("""
                     INSERT OR IGNORE INTO documents 
-                    (id, canonical_url, title, content_hash, domain, 
+                    (id, canonical_url, title, summary, content_hash, domain, 
                      detected_content_type, quality_score, quality_components,
                      quality_profile_used, raw_html_hash, novelty_distance,
                      source_phase, content_length, created_at, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'active')
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'active')
                 """, (
                     kwargs['doc_id'],
                     kwargs['url'],
                     kwargs['metadata'].get('title', ''),
+                    summary,
                     hashlib.md5(kwargs['text'].encode()).hexdigest(),
                     self._get_domain(kwargs['url']),
                     kwargs['content_type'],

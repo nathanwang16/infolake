@@ -1,16 +1,16 @@
 {
     "paths": {
-        "data_dir": "./data",
-        "logs_dir": "./logs",
+        "data_dir": "/Volumes/Lemon T9/atlas/data",
+        "logs_dir": "/Volumes/Lemon T9/atlas/logs",
         "dumps_dir": "./dataset",
-        "archive_dir": "./data/archive",
-        "parsed_archive_dir": "./data/parsed_archive",
-        "golden_set_path": "./data/golden_set.db",
-        "exports_dir": "./data/exports",
-        "mappings_dir": "./data/mappings"
+        "archive_dir": "/Volumes/Lemon T9/atlas/archive",
+        "parsed_archive_dir": "/Volumes/Lemon T9/atlas/parsed_archive",
+        "golden_set_path": "/Volumes/Lemon T9/atlas/golden_set.db",
+        "exports_dir": "/Volumes/Lemon T9/atlas/exports",
+        "mappings_dir": "/Volumes/Lemon T9/atlas/mappings"
     },
     "database": {
-        "sqlite_path": "./data/atlas.db"
+        "sqlite_path": "/Volumes/Lemon T9/atlas/data/atlas.db"
     },
     "qdrant": {
         "url": "http://localhost:6333",
@@ -21,18 +21,18 @@
     "embedding": {
         "model": "BAAI/bge-small-en-v1.5",
         "device": "mps",
-        "batch_size": 32,
+        "batch_size": 128,
         "max_tokens": 512
     },
     "batch_processing": {
-        "default_dump": "./dataset/sample-test-50.tar",
-        "workers": 8,
-        "worker_batch_size": 32,
+        "default_dump": "/Users/lemon/Downloads/sample-l.tar",
+        "workers": 16,
+        "worker_batch_size": 64,
         "quality_weight_alpha": 1.0,
         "novelty_threshold": 0.08,
         "quality_threshold": 0.3,
-        "url_queue_size": 5000,
-        "embed_queue_size": 2000,
+        "url_queue_size": 10000,
+        "embed_queue_size": 5000,
         "lazy_greedy": true,
         "expected_documents": 100000,
         "limit": 0
@@ -79,7 +79,7 @@
     "mapping": {
         "input_source": "qdrant",
         "output_format": "json",
-        "output_path": "./data/mappings/latest.json",
+        "output_path": "/Volumes/Lemon T9/atlas/mappings/latest.json",
         "umap": {
             "neighbors": 15,
             "min_dist": 0.1,
@@ -93,11 +93,27 @@
     "visualizer": {
         "host": "localhost",
         "port": 8080,
-        "static_dir": "./visualizer/static"
+        "static_dir": "./visualizer/static",
+        "dot_radius": 1,
+        "dot_importance_scale": 2,
+        "connection_color": "#ffffff",
+        "connection_width": 0.7,
+        "connection_opacity": 0.8
     },
     "monitor": {
         "gini_alert_threshold": 0.6,
         "orphan_review_threshold": 100,
         "drift_alert_delta": 0.05
+    },
+    "summarizer": {
+        "backend": "ollama",
+        "local_model": "sshleifer/distilbart-cnn-6-6",
+        "ollama_model": "llama3.2:1b",
+        "max_length": 80
+    },
+    "llm": {
+        "provider": "openai",
+        "model": "gpt-4o-mini",
+        "api_key": null
     }
 }

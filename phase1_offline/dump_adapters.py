@@ -247,7 +247,7 @@ class JSONLAdapter(DumpAdapter):
     def supports(self, path: Path) -> bool:
         """Supports .jsonl, .json, and gzipped variants."""
         path_str = str(path).lower()
-        return any(path_str.endswith(ext) for ext in ['.jsonl', '.jsonl.gz', '.json', '.ndjson'])
+        return any(path_str.endswith(ext) for ext in ['.jsonl', '.jsonl.gz', '.json', '.json.gz', '.ndjson'])
     
     def iterate(self, path: Path) -> Generator[DumpRecord, None, None]:
         """Iterates through JSONL records."""
@@ -378,11 +378,85 @@ class CurlieAdapter(DumpAdapter):
             raise
 
 
+class C4DirectoryAdapter(DumpAdapter):
+    """
+    Adapter for C4-style directories containing multiple JSONL files.
+    
+    C4 (Colossal Clean Crawled Corpus) stores data as directories of
+    gzipped JSONL files with fields: text, timestamp, url.
+    """
+    
+    def supports(self, path: Path) -> bool:
+        """Supports directories containing .json.gz files."""
+        if not path.is_dir():
+            return False
+        # Check if directory contains json.gz files
+        json_files = list(path.glob("**/*.json.gz"))
+        return len(json_files) > 0
+    
+    def iterate(self, path: Path) -> Generator[DumpRecord, None, None]:
+        """Iterates through all JSONL files in the directory."""
+        if not path.exists():
+            raise FileNotFoundError(f"Directory not found: {path}")
+        
+        if not path.is_dir():
+            raise ValueError(f"Path is not a directory: {path}")
+        
+        import gzip
+        
+        # Find all json.gz files recursively
+        json_files = sorted(path.glob("**/*.json.gz"))
+        total_files = len(json_files)
+        
+        logger.info(f"Found {total_files} JSONL files in {path}")
+        
+        for file_idx, json_file in enumerate(json_files):
+            try:
+                with gzip.open(json_file, 'rt', encoding='utf-8') as f:
+                    for line_num, line in enumerate(f, 1):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        
+                        try:
+                            data = json.loads(line)
+                            url = data.get('url') or data.get('URL')
+                            
+                            if not url:
+                                continue
+                            
+                            # C4 has pre-extracted text, use it directly
+                            text = data.get('text', '')
+                            
+                            yield DumpRecord(
+                                url=url,
+                                html=None,  # C4 has text, not HTML
+                                metadata={
+                                    'text': text,
+                                    'timestamp': data.get('timestamp'),
+                                    'source_file': json_file.name,
+                                    'pre_extracted': True
+                                },
+                                domain=None
+                            )
+                            
+                        except json.JSONDecodeError:
+                            continue
+                
+                if (file_idx + 1) % 10 == 0:
+                    logger.info(f"Processed {file_idx + 1}/{total_files} C4 files")
+                    
+            except Exception as e:
+                logger.error(f"Failed to process C4 file {json_file}: {e}")
+                continue
+
+
 class AdapterRegistry:
     """Registry for dump format adapters with automatic format detection."""
     
     def __init__(self):
         self._adapters: List[DumpAdapter] = [
+            C4DirectoryAdapter(),  # Check directory adapters first
             SlopAdapter(),
             JSONLAdapter(),
             PlainTextAdapter(),
