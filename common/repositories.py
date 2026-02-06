@@ -465,6 +465,82 @@ class GoldenSetRepository:
             conn.close()
 
 
+class DocumentTextRepository:
+    """Repository for document full text storage (deferred scoring)."""
+
+    def __init__(self, database=None):
+        self._db = database or _default_db
+
+    def insert(self, doc_id: str, text: str, conn=None) -> None:
+        """Insert a single document text."""
+        owns_conn = conn is None
+        if owns_conn:
+            conn = self._db.get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR IGNORE INTO document_texts (doc_id, text) VALUES (?, ?)",
+                (doc_id, text),
+            )
+            if owns_conn:
+                conn.commit()
+        except Exception:
+            if owns_conn:
+                conn.rollback()
+            raise
+        finally:
+            if owns_conn:
+                conn.close()
+
+    def insert_batch(self, items: List[tuple], conn=None) -> None:
+        """Insert multiple (doc_id, text) tuples in one transaction."""
+        owns_conn = conn is None
+        if owns_conn:
+            conn = self._db.get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.executemany(
+                "INSERT OR IGNORE INTO document_texts (doc_id, text) VALUES (?, ?)",
+                items,
+            )
+            if owns_conn:
+                conn.commit()
+        except Exception:
+            if owns_conn:
+                conn.rollback()
+            raise
+        finally:
+            if owns_conn:
+                conn.close()
+
+    def get_text(self, doc_id: str) -> Optional[str]:
+        """Get text for a single document."""
+        conn = self._db.get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT text FROM document_texts WHERE doc_id = ?", (doc_id,))
+            row = cursor.fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+
+    def get_unscored_batch(self, batch_size: int = 1000) -> List[tuple]:
+        """Get batch of (doc_id, text) for documents pending scoring."""
+        conn = self._db.get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT dt.doc_id, dt.text
+                FROM document_texts dt
+                JOIN documents d ON d.id = dt.doc_id
+                WHERE d.quality_profile_used = 'pending'
+                LIMIT ?
+            """, (batch_size,))
+            return cursor.fetchall()
+        finally:
+            conn.close()
+
+
 class JobRepository:
     """Replaces raw SQL in producer.py."""
 

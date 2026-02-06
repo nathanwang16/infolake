@@ -622,9 +622,9 @@ class ConcurrentEmbedder(threading.Thread):
         logger.info(f"ConcurrentEmbedder finished: {self._stats}")
     
     def _process_batch(self, batch: List[Dict]):
-        """Embeds a batch of items."""
+        """Embeds a batch of items with OOM protection."""
         model = get_embedding_model()
-        
+
         if model is None:
             # Mock embeddings
             for item in batch:
@@ -632,23 +632,42 @@ class ConcurrentEmbedder(threading.Thread):
                 self.output_queue.put(item)
             self._stats['items'] += len(batch)
             return
-        
+
+        self._encode_with_oom_retry(model, batch)
+
+    def _encode_with_oom_retry(self, model, batch: List[Dict], current_batch_size: int = None):
+        """Encodes batch, retrying with half batch size on OOM."""
+        if current_batch_size is None:
+            current_batch_size = len(batch)
+
         try:
             texts = [item['text'] for item in batch]
             embeddings = model.encode(
                 texts,
                 normalize_embeddings=True,
                 show_progress_bar=False,
-                batch_size=len(texts)
+                batch_size=current_batch_size
             )
-            
+
             for item, emb in zip(batch, embeddings):
                 item['embedding'] = emb.tolist()
                 self.output_queue.put(item)
-            
+
             self._stats['batches'] += 1
             self._stats['items'] += len(batch)
-            
+
+        except RuntimeError as e:
+            if 'out of memory' in str(e).lower() or 'MPS' in str(e):
+                half = max(1, current_batch_size // 2)
+                logger.warning(f"OOM with batch_size={current_batch_size}, retrying with {half}")
+                if half < current_batch_size:
+                    self._encode_with_oom_retry(model, batch, half)
+                else:
+                    logger.error(f"OOM even with batch_size=1, dropping {len(batch)} items")
+                    self._stats['errors'] += len(batch)
+            else:
+                logger.error(f"Batch embedding failed: {e}")
+                self._stats['errors'] += len(batch)
         except Exception as e:
             logger.error(f"Batch embedding failed: {e}")
             self._stats['errors'] += len(batch)
@@ -664,6 +683,496 @@ class ConcurrentEmbedder(threading.Thread):
         # Wait for embedder to finish
         self.join(timeout=timeout)
     
+    def get_stats(self) -> Dict[str, int]:
+        return self._stats.copy()
+
+
+def _extract_worker_fn(item_tuple):
+    """
+    Top-level extraction function for ProcessPoolExecutor.
+
+    Must be module-level (not a method) for pickling.
+    Each subprocess imports trafilatura independently.
+
+    Args:
+        item_tuple: (url, html, metadata) - the item to extract
+
+    Returns:
+        (url, text, metadata, raw_html_hash) or None on failure
+    """
+    import hashlib
+    import re
+
+    url, html, metadata = item_tuple
+
+    # Handle pre-extracted text passthrough
+    if metadata and metadata.get('pre_extracted') and metadata.get('text'):
+        text = metadata['text']
+        raw_hash = hashlib.sha256(text.encode('utf-8', errors='ignore')).hexdigest()
+        return (url, text, metadata, raw_hash)
+
+    if not html:
+        return None
+
+    # Compute raw HTML hash
+    raw_hash = hashlib.sha256(html.encode('utf-8', errors='ignore')).hexdigest()
+
+    try:
+        import trafilatura
+        text = trafilatura.extract(
+            html,
+            include_comments=False,
+            include_tables=False,
+            url=url
+        )
+
+        if not text:
+            return None
+
+        # Extract metadata from trafilatura
+        try:
+            meta = trafilatura.extract_metadata(html)
+            if meta:
+                meta_dict = meta.as_dict()
+                metadata = metadata or {}
+                metadata.update({
+                    'title': meta_dict.get('title'),
+                    'author': meta_dict.get('author'),
+                    'date': meta_dict.get('date'),
+                    'description': meta_dict.get('description'),
+                    'sitename': meta_dict.get('sitename'),
+                })
+        except Exception:
+            pass
+
+    except Exception:
+        # Fallback: try readability
+        try:
+            from readability import Document
+            doc = Document(html)
+            text = doc.summary()
+            if metadata is None:
+                metadata = {}
+            metadata['title'] = doc.title()
+            text = re.sub(r'<[^>]+>', ' ', text)
+            text = re.sub(r'\s+', ' ', text).strip()
+        except Exception:
+            return None
+
+    if not text:
+        return None
+
+    # Final cleanup
+    text = re.sub(r'\n\s*\n', '\n\n', text).strip()
+
+    # Min length guard
+    if len(text) < 100:
+        return None
+
+    # Max length truncation
+    if len(text) > 100_000:
+        text = text[:100_000]
+
+    return (url, text, metadata or {}, raw_hash)
+
+
+class AsyncFetcher(threading.Thread):
+    """
+    Async HTTP fetcher running in a dedicated thread with its own asyncio event loop.
+
+    Uses aiohttp with configurable concurrency for high-throughput URL fetching.
+    Passes through items with pre-fetched HTML or pre-extracted text.
+    Optional playwright fallback for JS-rendered pages.
+    """
+
+    def __init__(
+        self,
+        input_queue: Queue,
+        output_queue: Queue,
+        concurrency: Optional[int] = None,
+        timeout: Optional[int] = None,
+        use_playwright: bool = False,
+        playwright_concurrency: int = 4,
+    ):
+        super().__init__(name="AsyncFetcher", daemon=True)
+        self.input_queue = input_queue
+        self.output_queue = output_queue
+        self.concurrency = concurrency or config.get("batch_processing.fetch_concurrency")
+        self.timeout = timeout or config.get("batch_processing.fetch_timeout")
+        self.use_playwright = use_playwright
+        self.playwright_concurrency = playwright_concurrency
+        self.running = True
+        self._draining = False
+
+        self._stats = {
+            'fetched': 0,
+            'fetch_errors': 0,
+            'playwright_fetched': 0,
+            'pre_fetched': 0,
+            'pre_extracted': 0,
+        }
+
+    def run(self):
+        """Creates new asyncio event loop in thread and runs fetch loop."""
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._fetch_loop())
+        finally:
+            loop.close()
+        logger.info(f"AsyncFetcher finished: {self._stats}")
+
+    async def _fetch_loop(self):
+        """Main async fetch loop."""
+        import asyncio
+        try:
+            import aiohttp
+        except ImportError:
+            logger.warning("aiohttp not installed, falling back to synchronous fetching")
+            self._sync_fallback_loop()
+            return
+
+        connector = aiohttp.TCPConnector(
+            limit=self.concurrency,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True,
+        )
+        client_timeout = aiohttp.ClientTimeout(total=self.timeout)
+        headers = {
+            'User-Agent': 'TruthAtlas/1.0 (Research Crawler)',
+            'Accept': 'text/html,application/xhtml+xml',
+            'Accept-Language': 'en-US,en;q=0.9',
+        }
+
+        # Playwright browser (optional)
+        playwright_sem = None
+        browser = None
+        if self.use_playwright:
+            try:
+                from playwright.async_api import async_playwright
+                pw = await async_playwright().start()
+                browser = await pw.chromium.launch(headless=True)
+                playwright_sem = asyncio.Semaphore(self.playwright_concurrency)
+                logger.info(f"Playwright browser launched (concurrency={self.playwright_concurrency})")
+            except Exception as e:
+                logger.warning(f"Playwright not available: {e}")
+                browser = None
+
+        async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=client_timeout,
+            headers=headers,
+        ) as session:
+            pending_tasks = set()
+            max_pending = self.concurrency
+
+            while self.running or self._draining or not self.input_queue.empty() or pending_tasks:
+                # Fill up pending tasks from input queue
+                while len(pending_tasks) < max_pending:
+                    try:
+                        item = self.input_queue.get_nowait()
+                    except Exception:
+                        break
+                    task = asyncio.create_task(
+                        self._fetch_one(session, item, browser, playwright_sem)
+                    )
+                    pending_tasks.add(task)
+                    task.add_done_callback(pending_tasks.discard)
+
+                if not pending_tasks:
+                    if self._draining and self.input_queue.empty():
+                        break
+                    await asyncio.sleep(0.05)
+                    continue
+
+                # Wait for at least one task to complete
+                done, pending_tasks = await asyncio.wait(
+                    pending_tasks, timeout=0.5, return_when=asyncio.FIRST_COMPLETED
+                )
+
+                for task in done:
+                    try:
+                        task.result()  # propagate exceptions to log
+                    except Exception as e:
+                        logger.debug(f"Fetch task error: {e}")
+
+        if browser:
+            await browser.close()
+
+    async def _fetch_one(self, session, item, browser=None, playwright_sem=None):
+        """Fetch a single item."""
+        from phase1_offline.producer import QueueItem
+
+        url = item.url
+        metadata = item.metadata or {}
+
+        # Passthrough for pre-extracted text
+        if metadata.get('pre_extracted') and metadata.get('text'):
+            self._stats['pre_extracted'] += 1
+            self.output_queue.put((url, None, metadata))
+            self.input_queue.task_done()
+            return
+
+        # Passthrough for pre-fetched HTML
+        if item.html:
+            self._stats['pre_fetched'] += 1
+            self.output_queue.put((url, item.html, metadata))
+            self.input_queue.task_done()
+            return
+
+        # Fetch via aiohttp
+        html = await self._aiohttp_fetch(session, url)
+
+        if html:
+            self._stats['fetched'] += 1
+            self.output_queue.put((url, html, metadata))
+            self.input_queue.task_done()
+            return
+
+        # Playwright fallback for JS-rendered pages
+        if browser and playwright_sem:
+            html = await self._playwright_fetch(browser, playwright_sem, url)
+            if html:
+                self._stats['playwright_fetched'] += 1
+                self.output_queue.put((url, html, metadata))
+                self.input_queue.task_done()
+                return
+
+        self._stats['fetch_errors'] += 1
+        self.input_queue.task_done()
+
+    async def _aiohttp_fetch(self, session, url: str, max_retries: int = 2) -> Optional[str]:
+        """Fetch URL with aiohttp and retry logic."""
+        import aiohttp
+        import asyncio
+
+        for attempt in range(max_retries):
+            try:
+                async with session.get(url, allow_redirects=True) as response:
+                    if response.status == 200:
+                        return await response.text(errors='replace')
+                    elif response.status in (429, 503):
+                        await asyncio.sleep(2 ** attempt)
+                    else:
+                        return None
+            except asyncio.TimeoutError:
+                pass
+            except aiohttp.ClientError:
+                pass
+            except Exception:
+                return None
+
+            if attempt < max_retries - 1:
+                await asyncio.sleep(0.5 * (2 ** attempt))
+
+        return None
+
+    async def _playwright_fetch(self, browser, sem, url: str) -> Optional[str]:
+        """Fetch URL with playwright for JS-rendered pages."""
+        import asyncio
+
+        async with sem:
+            page = None
+            try:
+                page = await browser.new_page()
+                await page.goto(url, timeout=self.timeout * 1000, wait_until='networkidle')
+                html = await page.content()
+                return html
+            except asyncio.TimeoutError:
+                return None
+            except Exception:
+                return None
+            finally:
+                if page:
+                    await page.close()
+
+    def _sync_fallback_loop(self):
+        """Synchronous fallback when aiohttp is not installed."""
+        while self.running or self._draining or not self.input_queue.empty():
+            try:
+                item = self.input_queue.get(timeout=0.5)
+            except Empty:
+                if self._draining and self.input_queue.empty():
+                    break
+                continue
+
+            from phase1_offline.producer import QueueItem
+            url = item.url
+            metadata = item.metadata or {}
+
+            if metadata.get('pre_extracted') and metadata.get('text'):
+                self._stats['pre_extracted'] += 1
+                self.output_queue.put((url, None, metadata))
+                self.input_queue.task_done()
+                continue
+
+            if item.html:
+                self._stats['pre_fetched'] += 1
+                self.output_queue.put((url, item.html, metadata))
+                self.input_queue.task_done()
+                continue
+
+            # Synchronous fetch
+            try:
+                import requests
+                response = requests.get(url, timeout=self.timeout, headers={
+                    'User-Agent': 'TruthAtlas/1.0 (Research Crawler)',
+                })
+                if response.status_code == 200:
+                    self._stats['fetched'] += 1
+                    self.output_queue.put((url, response.text, metadata))
+                else:
+                    self._stats['fetch_errors'] += 1
+            except Exception:
+                self._stats['fetch_errors'] += 1
+
+            self.input_queue.task_done()
+
+    def stop(self):
+        """Signals fetcher to stop."""
+        self.running = False
+
+    def drain_and_stop(self, timeout: float = 30.0):
+        """Drains remaining items and stops."""
+        self._draining = True
+        self.running = False
+        self.join(timeout=timeout)
+
+    def get_stats(self) -> Dict[str, int]:
+        return self._stats.copy()
+
+
+class ExtractPool:
+    """
+    Coordinator that dispatches HTML extraction to a ProcessPoolExecutor.
+
+    Reads (url, html, metadata) tuples from html_queue, submits to process pool,
+    collects results and puts (url, text, metadata, raw_html_hash) on text_queue.
+    """
+
+    def __init__(
+        self,
+        html_queue: Queue,
+        text_queue: Queue,
+        num_processes: Optional[int] = None,
+    ):
+        self.html_queue = html_queue
+        self.text_queue = text_queue
+        self.num_processes = num_processes or config.get("batch_processing.extract_processes")
+        self._executor = None
+        self._thread = None
+        self.running = True
+        self._draining = False
+
+        self._stats = {
+            'extracted': 0,
+            'extract_errors': 0,
+            'passthrough': 0,
+        }
+
+    def start(self):
+        """Starts the coordinator thread and process pool."""
+        from concurrent.futures import ProcessPoolExecutor
+        self._executor = ProcessPoolExecutor(max_workers=self.num_processes)
+        self._thread = threading.Thread(target=self._run, name="ExtractPool", daemon=True)
+        self._thread.start()
+        logger.info(f"ExtractPool started with {self.num_processes} processes")
+
+    def _run(self):
+        """Main coordinator loop."""
+        from concurrent.futures import as_completed
+        futures = {}
+        max_inflight = self.num_processes * 4  # Keep pool busy
+
+        while self.running or self._draining or not self.html_queue.empty() or futures:
+            # Submit new work
+            while len(futures) < max_inflight:
+                try:
+                    item = self.html_queue.get_nowait()
+                except Empty:
+                    break
+
+                url, html, metadata = item
+
+                # Passthrough for pre-extracted text
+                if metadata and metadata.get('pre_extracted') and metadata.get('text'):
+                    import hashlib
+                    text = metadata['text']
+                    raw_hash = hashlib.sha256(
+                        text.encode('utf-8', errors='ignore')
+                    ).hexdigest()
+                    self.text_queue.put({
+                        'url': url,
+                        'text': text,
+                        'metadata': metadata,
+                        'raw_html_hash': raw_hash,
+                    })
+                    self._stats['passthrough'] += 1
+                    self.html_queue.task_done()
+                    continue
+
+                future = self._executor.submit(
+                    _extract_worker_fn, (url, html, metadata)
+                )
+                futures[future] = url
+                self.html_queue.task_done()
+
+            if not futures:
+                if self._draining and self.html_queue.empty():
+                    break
+                time.sleep(0.05)
+                continue
+
+            # Collect completed futures
+            done = []
+            for future in list(futures):
+                if future.done():
+                    done.append(future)
+
+            if not done:
+                time.sleep(0.02)
+                continue
+
+            for future in done:
+                url = futures.pop(future)
+                try:
+                    result = future.result()
+                    if result:
+                        r_url, text, metadata, raw_hash = result
+                        self.text_queue.put({
+                            'url': r_url,
+                            'text': text,
+                            'metadata': metadata,
+                            'raw_html_hash': raw_hash,
+                        })
+                        self._stats['extracted'] += 1
+                    else:
+                        self._stats['extract_errors'] += 1
+                except Exception as e:
+                    logger.debug(f"Extraction failed for {url}: {e}")
+                    self._stats['extract_errors'] += 1
+
+        logger.info(f"ExtractPool finished: {self._stats}")
+
+    def stop(self):
+        """Signals pool to stop."""
+        self.running = False
+
+    def drain_and_stop(self, timeout: float = 60.0):
+        """Drains remaining items and stops."""
+        self._draining = True
+        self.running = False
+        if self._thread:
+            self._thread.join(timeout=timeout)
+        if self._executor:
+            self._executor.shutdown(wait=True)
+
+    def join(self, timeout: Optional[float] = None):
+        """Waits for coordinator thread."""
+        if self._thread:
+            self._thread.join(timeout=timeout)
+
     def get_stats(self) -> Dict[str, int]:
         return self._stats.copy()
 

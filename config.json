@@ -21,7 +21,7 @@
     "embedding": {
         "model": "BAAI/bge-small-en-v1.5",
         "device": "mps",
-        "batch_size": 128,
+        "batch_size": 256,
         "max_tokens": 512
     },
     "batch_processing": {
@@ -35,7 +35,14 @@
         "embed_queue_size": 5000,
         "lazy_greedy": true,
         "expected_documents": 100000,
-        "limit": 0
+        "limit": 0,
+        "fetch_concurrency": 100,
+        "fetch_timeout": 15,
+        "use_playwright": false,
+        "playwright_concurrency": 4,
+        "extract_processes": 8,
+        "skip_scoring": true,
+        "skip_url_filter": true
     },
     "content_extraction": {
         "extractor": "trafilatura",
