@@ -24,27 +24,27 @@ class JsonFormatter(logging.Formatter):
 def setup_logger(name: str, log_dir: str = "logs", level: int = logging.INFO, console_output: bool = True) -> logging.Logger:
     """
     Sets up a logger with both file and console handlers.
-    
+
     Args:
         name: Name of the logger
         log_dir: Directory to store log files
         level: Logging level
         console_output: Whether to output to console
-        
+
     Returns:
         Configured logger instance
     """
     # Create logs directory if it doesn't exist
     log_path = Path(log_dir)
     log_path.mkdir(parents=True, exist_ok=True)
-    
+
     logger = logging.getLogger(name)
     logger.setLevel(level)
-    
+
     # Avoid adding handlers multiple times
     if logger.handlers:
         return logger
-        
+
     # File Handler - JSON formatted
     file_handler = RotatingFileHandler(
         log_path / f"{name}.jsonl",
@@ -53,7 +53,7 @@ def setup_logger(name: str, log_dir: str = "logs", level: int = logging.INFO, co
     )
     file_handler.setFormatter(JsonFormatter())
     logger.addHandler(file_handler)
-    
+
     # Console Handler - Human readable
     if console_output:
         console_handler = logging.StreamHandler(sys.stdout)
@@ -62,7 +62,7 @@ def setup_logger(name: str, log_dir: str = "logs", level: int = logging.INFO, co
         )
         console_handler.setFormatter(console_formatter)
         logger.addHandler(console_handler)
-        
+
     return logger
 
 def get_logger(name: str) -> logging.Logger:

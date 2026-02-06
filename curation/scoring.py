@@ -120,34 +120,7 @@ class QualityScorer:
         # 7. Source Reputation (Domain based)
         domain = metadata.get("domain", "") or self._get_domain(metadata.get("url", ""))
         source_reputation = 0.5 # Neutral default
-        
-        # URL-based heuristics for when content is missing (Simulation/Cold start)
-        # This helps the calibration loop demonstrate learning even without full content fetching
-        url_str = metadata.get("url", "").lower()
-        
-        # Default neutral score
-        link_density_score = 0.5 
-        
-        # Detect "Garbage" signals in URL
-        garbage_keywords = ["hack", "crack", "free", "generator", "unlimited", "glitch", "cheat", "scam", "download-ram", "serial-key"]
-        if any(k in url_str for k in garbage_keywords):
-            # Penalty applied to various metrics to simulate low quality
-            structural_integrity *= 0.1
-            writing_quality *= 0.1
-            citation_score *= 0.1 # Correct variable name
-            source_reputation = 0.1
-            link_density_score = 0.1 # Force penalty
 
-        # Detect "Exemplary" signals in URL
-        exemplary_keywords = ["docs", "documentation", "research", "edu", "gov", "reference", "manual", "guide", "journal", "arxiv"]
-        if any(k in url_str for k in exemplary_keywords):
-            # Boost
-            structural_integrity = max(structural_integrity, 0.8)
-            writing_quality = max(writing_quality, 0.8)
-            citation_score = max(citation_score, 0.5) # Boost citation score too
-            source_reputation = max(source_reputation, 0.9)
-            link_density_score = 0.9 # Assume good links
-            
         if domain:
             if any(d in domain for d in [".edu", ".gov", ".mil"]):
                 source_reputation = 0.9
@@ -156,9 +129,6 @@ class QualityScorer:
             elif "wordpress" in domain or "blogspot" in domain:
                 source_reputation = 0.4 # Slightly lower baseline for unverified blogs
         
-        # Remove the strict None check that was causing failures
-        # if link_density_score is None: ...
-
         return {
             "citation_quality": citation_score,
             "writing_quality": writing_quality,
@@ -167,7 +137,6 @@ class QualityScorer:
             "specificity": specificity,
             "source_reputation": source_reputation,
             "structural_integrity": structural_integrity,
-            "link_density_penalty": link_density_score
         }
 
     def _get_domain(self, url: str) -> str:

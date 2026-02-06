@@ -26,7 +26,7 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.logging.logger import setup_logger, get_logger
+from common.logging.logger import setup_logger, get_logger
 from common.config import config
 
 logger = get_logger("visualizer")
@@ -40,14 +40,14 @@ def main():
     # All params default to config.json values
     parser.add_argument(
         "--host",
-        default=config.get("visualizer.host", "localhost"),
-        help=f"Host to bind (default: {config.get('visualizer.host', 'localhost')})"
+        default=config.get("visualizer.host"),
+        help=f"Host to bind (default: {config.get('visualizer.host')})"
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=config.get("visualizer.port", 8080),
-        help=f"Port to listen (default: {config.get('visualizer.port', 8080)})"
+        default=config.get("visualizer.port"),
+        help=f"Port to listen (default: {config.get('visualizer.port')})"
     )
     parser.add_argument(
         "--static-dir",

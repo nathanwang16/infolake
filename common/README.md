@@ -1,8 +1,30 @@
 # Common Module
 
-Shared utilities and configuration management.
+Shared utilities, configuration management, and logging infrastructure.
 
 ## Components
+
+### Logging (`logging/logger.py`)
+Structured JSON logging with automatic file rotation:
+
+```python
+from common.logging.logger import get_logger, setup_logger
+
+logger = get_logger("pipeline")
+logger.info("Processing started", extra={"count": 100})
+```
+
+**Output format (JSONL):**
+```json
+{"timestamp": "2026-01-29T16:30:00", "level": "INFO", "name": "pipeline", "message": "Processing started", "count": 100}
+```
+
+**Features:**
+- Per-module log files in `logs/`
+- Console output (INFO+) and file output (DEBUG+)
+- Automatic exception formatting
+- Context fields via `extra` dict
+- Rotating file handler (10MB max, 5 backups)
 
 ### Config (`config.py`)
 Singleton configuration loader:

@@ -24,9 +24,11 @@ from typing import Dict, List, Any, Optional, Tuple
 
 import numpy as np
 
-from src.logging.logger import get_logger, setup_logger
+from common.logging.logger import get_logger, setup_logger
 from common.config import config
 from common.database import db
+from common.repositories import DocumentRepository
+from common.qdrant_manager import QdrantManager
 
 logger = get_logger("mapper")
 
@@ -197,33 +199,40 @@ class AtlasMapper:
         umap_neighbors: int = 15,
         umap_min_dist: float = 0.1,
         hdbscan_min_cluster_size: int = 5,  # Lower for small test datasets
-        sample_for_fit: int = 100000
+        sample_for_fit: int = 100000,
+        database=None,
+        qdrant_manager=None,
+        doc_repo=None,
     ):
-        self.output_dir = Path(output_dir or config.get("paths.data_dir", "data"))
+        self.output_dir = Path(output_dir or config.get("paths.data_dir"))
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+
+        # DI
+        self._database = database or db
+        self._qdrant_mgr = qdrant_manager or QdrantManager()
+        self._doc_repo = doc_repo or DocumentRepository(self._database)
+
         # UMAP config
         self.umap_neighbors = umap_neighbors
         self.umap_min_dist = umap_min_dist
         self.sample_for_fit = sample_for_fit
-        
+
         # HDBSCAN config
         self.hdbscan_min_cluster_size = hdbscan_min_cluster_size
-        
+
         # Components
         self.importance_scorer = ImportanceScorer()
-        
+
         # State
         self._umap_model = None
         self._embeddings: List[np.ndarray] = []
         self._doc_ids: List[str] = []
         self._mappings: List[MappingResult] = []
-        
-        # Qdrant client
-        self.qdrant = None
-        self.qdrant_collection = config.get("qdrant.collection", "atlas_embeddings")
-        self._init_qdrant()
-        
+
+        # Backwards-compatible properties
+        self.qdrant = self._qdrant_mgr.client
+        self.qdrant_collection = self._qdrant_mgr.collection_name
+
         # Stats
         self._stats = {
             'documents_mapped': 0,
@@ -231,32 +240,9 @@ class AtlasMapper:
             'orphaned_docs': 0,
             'mapping_time_seconds': 0,
         }
-        
+
         logger.info(f"AtlasMapper initialized (neighbors={umap_neighbors}, "
                    f"min_dist={umap_min_dist}, min_cluster={hdbscan_min_cluster_size})")
-    
-    def _init_qdrant(self):
-        """Initializes Qdrant client for fetching embeddings."""
-        try:
-            from qdrant_client import QdrantClient
-            
-            url = config.get("qdrant.url", "http://localhost:6333")
-            self.qdrant = QdrantClient(url=url, timeout=10)
-            
-            # Verify collection exists
-            try:
-                self.qdrant.get_collection(self.qdrant_collection)
-                logger.info(f"Connected to Qdrant collection: {self.qdrant_collection}")
-            except Exception as e:
-                logger.warning(f"Qdrant collection not found: {e}")
-                self.qdrant = None
-                
-        except ImportError:
-            logger.warning("qdrant-client not installed, embeddings must be provided")
-            self.qdrant = None
-        except Exception as e:
-            logger.warning(f"Qdrant connection failed: {e}")
-            self.qdrant = None
     
     def load_embeddings_from_qdrant(self, limit: Optional[int] = None) -> int:
         """
@@ -268,19 +254,18 @@ class AtlasMapper:
         Returns:
             Number of embeddings loaded
         """
-        if not self.qdrant:
+        if not self._qdrant_mgr.available:
             raise RuntimeError("Qdrant client not available")
-        
+
         logger.info("Loading embeddings from Qdrant...")
-        
+
         try:
             # Scroll through all points
             offset = None
             batch_size = 1000
-            
+
             while True:
-                results = self.qdrant.scroll(
-                    collection_name=self.qdrant_collection,
+                results = self._qdrant_mgr.scroll(
                     offset=offset,
                     limit=batch_size,
                     with_vectors=True
@@ -438,26 +423,17 @@ class AtlasMapper:
     def compute_importance_scores(self) -> List[float]:
         """
         Computes importance scores for all documents.
-        
+
         Returns:
             List of importance scores (Z-axis values)
         """
         logger.info("Computing importance scores...")
-        
-        conn = db.get_connection()
-        cursor = conn.cursor()
-        
+
         importance_scores = []
-        
+
         for doc_id in self._doc_ids:
-            # Fetch document metadata
-            cursor.execute("""
-                SELECT domain, quality_score, detected_content_type
-                FROM documents WHERE id = ?
-            """, (doc_id,))
-            
-            row = cursor.fetchone()
-            
+            row = self._doc_repo.get_metadata_for_mapping(doc_id)
+
             if row:
                 domain, quality_score, content_type = row
                 importance = self.importance_scorer.compute_importance(
@@ -467,9 +443,9 @@ class AtlasMapper:
                 )
             else:
                 importance = 0.5  # Default for missing documents
-            
+
             importance_scores.append(importance)
-        
+
         logger.info(f"Computed {len(importance_scores)} importance scores")
         return importance_scores
     
@@ -487,7 +463,7 @@ class AtlasMapper:
         
         # Load embeddings if not already loaded
         if not self._embeddings:
-            if self.qdrant:
+            if self._qdrant_mgr.available:
                 self.load_embeddings_from_qdrant()
             else:
                 raise RuntimeError("No embeddings loaded and Qdrant not available")
@@ -506,14 +482,10 @@ class AtlasMapper:
         importance_scores = self.compute_importance_scores()
         
         # 4. Fetch quality scores from database
-        conn = db.get_connection()
-        cursor = conn.cursor()
-        
         quality_scores = []
         for doc_id in self._doc_ids:
-            cursor.execute("SELECT quality_score FROM documents WHERE id = ?", (doc_id,))
-            row = cursor.fetchone()
-            quality_scores.append(row[0] if row else 0.5)
+            qs = self._doc_repo.get_quality_score(doc_id)
+            quality_scores.append(qs if qs is not None else 0.5)
         
         # 5. Build mapping results
         self._mappings = []
@@ -540,20 +512,15 @@ class AtlasMapper:
         """Updates database with computed coordinates and cluster assignments."""
         if not self._mappings:
             raise RuntimeError("No mappings computed. Call run_full_mapping first.")
-        
+
         logger.info("Updating database with mapping coordinates...")
-        
-        conn = db.get_connection()
-        cursor = conn.cursor()
-        
-        for mapping in self._mappings:
-            cursor.execute("""
-                UPDATE documents 
-                SET cluster_id = ?, importance_score = ?
-                WHERE id = ?
-            """, (mapping.cluster_id, mapping.z, mapping.doc_id))
-        
-        conn.commit()
+
+        updates = [
+            (mapping.cluster_id, mapping.z, mapping.doc_id)
+            for mapping in self._mappings
+        ]
+        self._doc_repo.update_mappings_batch(updates)
+
         logger.info(f"Updated {len(self._mappings)} documents in database")
     
     def export_to_parquet(self, filepath: Optional[str] = None) -> str:
@@ -617,25 +584,14 @@ class AtlasMapper:
             filepath = Path(filepath)
         
         # Add document metadata for visualization
-        conn = db.get_connection()
-        cursor = conn.cursor()
-        
         export_data = []
         for m in self._mappings:
-            cursor.execute("""
-                SELECT canonical_url, title, domain, detected_content_type
-                FROM documents WHERE id = ?
-            """, (m.doc_id,))
-            
-            row = cursor.fetchone()
-            
+            fields = self._doc_repo.get_export_fields(m.doc_id)
+
             doc_data = m.to_dict()
-            if row:
-                doc_data['url'] = row[0]
-                doc_data['title'] = row[1]
-                doc_data['domain'] = row[2]
-                doc_data['content_type'] = row[3]
-            
+            if fields:
+                doc_data.update(fields)
+
             export_data.append(doc_data)
         
         # Custom encoder for numpy types
@@ -721,7 +677,7 @@ Examples:
     mapper = AtlasMapper()
     
     try:
-        if mapper.qdrant:
+        if mapper._qdrant_mgr.available:
             mapper.load_embeddings_from_qdrant(limit=args.limit)
         else:
             logger.error("Qdrant not available and no embeddings provided")

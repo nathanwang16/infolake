@@ -17,7 +17,7 @@ import re
 import threading
 from typing import Optional
 
-from src.logging.logger import get_logger
+from common.logging.logger import get_logger
 from common.config import config
 
 logger = get_logger("summarizer")
@@ -53,7 +53,7 @@ class Summarizer:
     def _detect_backend(self) -> str:
         """Detects available summarization backend."""
         # Check config preference
-        preferred = config.get("summarizer.backend", "auto")
+        preferred = config.get("summarizer.backend")
         
         if preferred == "openai":
             if os.environ.get("OPENAI_API_KEY") or config.get("llm.api_key"):
@@ -148,7 +148,7 @@ class Summarizer:
                         _summarizer_model = AutoModelForSeq2SeqLM.from_pretrained(self.LOCAL_MODEL)
                         
                         # Select device
-                        device_config = config.get("embedding.device", "cpu")
+                        device_config = config.get("embedding.device")
                         if device_config == "mps" and torch.backends.mps.is_available():
                             _model_device = "mps"
                         elif device_config == "cuda" and torch.cuda.is_available():
@@ -251,7 +251,7 @@ class Summarizer:
         except ImportError:
             return self._summarize_excerpt(text, max_length)
         
-        model = config.get("summarizer.ollama_model", "llama3.2:1b")
+        model = config.get("summarizer.ollama_model")
         
         try:
             response = requests.post(

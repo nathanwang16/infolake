@@ -28,7 +28,7 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.logging.logger import setup_logger, get_logger
+from common.logging.logger import setup_logger, get_logger
 from common.config import config
 from phase1_offline.pipeline import BatchPipeline
 
@@ -49,25 +49,25 @@ def main():
     parser.add_argument(
         "--workers",
         type=int,
-        default=config.get("batch_processing.workers", 8),
-        help=f"Worker threads (default: {config.get('batch_processing.workers', 8)})"
+        default=config.get("batch_processing.workers"),
+        help=f"Worker threads (default: {config.get('batch_processing.workers')})"
     )
     parser.add_argument(
         "--limit",
         type=int,
-        default=config.get("batch_processing.limit", 0),
+        default=config.get("batch_processing.limit"),
         help="Limit URLs to process (0=no limit)"
     )
     parser.add_argument(
         "--url-queue-size",
         type=int,
-        default=config.get("batch_processing.url_queue_size", 5000),
+        default=config.get("batch_processing.url_queue_size"),
         help="URL queue capacity"
     )
     parser.add_argument(
         "--embed-queue-size",
         type=int,
-        default=config.get("batch_processing.embed_queue_size", 2000),
+        default=config.get("batch_processing.embed_queue_size"),
         help="Embedding queue capacity"
     )
     

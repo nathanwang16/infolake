@@ -27,7 +27,7 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.logging.logger import setup_logger, get_logger
+from common.logging.logger import setup_logger, get_logger
 from common.config import config
 
 logger = get_logger("compute_mapping")
@@ -41,31 +41,31 @@ def main():
     # All params default to config.json values
     parser.add_argument(
         "--output",
-        default=config.get("mapping.output_path", "./data/mappings/latest.json"),
+        default=config.get("mapping.output_path"),
         help="Output mapping file path"
     )
     parser.add_argument(
         "--format",
         choices=['json', 'parquet', 'both'],
-        default=config.get("mapping.output_format", "json"),
+        default=config.get("mapping.output_format"),
         help="Output format"
     )
     parser.add_argument(
         "--umap-neighbors",
         type=int,
-        default=config.get("mapping.umap.neighbors", 15),
+        default=config.get("mapping.umap.neighbors"),
         help="UMAP neighbors parameter"
     )
     parser.add_argument(
         "--umap-min-dist",
         type=float,
-        default=config.get("mapping.umap.min_dist", 0.1),
+        default=config.get("mapping.umap.min_dist"),
         help="UMAP min_dist parameter"
     )
     parser.add_argument(
         "--min-cluster-size",
         type=int,
-        default=config.get("mapping.hdbscan.min_cluster_size", 5),
+        default=config.get("mapping.hdbscan.min_cluster_size"),
         help="HDBSCAN min_cluster_size"
     )
     parser.add_argument(

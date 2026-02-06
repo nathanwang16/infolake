@@ -24,7 +24,7 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.logging.logger import setup_logger, get_logger
+from common.logging.logger import setup_logger, get_logger
 from common.config import config
 
 logger = get_logger("health_check")
@@ -38,7 +38,7 @@ def main():
     parser.add_argument(
         "--gini-threshold",
         type=float,
-        default=config.get("monitor.gini_alert_threshold", 0.6),
+        default=config.get("monitor.gini_alert_threshold"),
         help="Gini coefficient alert threshold"
     )
     

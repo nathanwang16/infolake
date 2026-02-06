@@ -29,11 +29,14 @@ from typing import Dict, Any, List, Optional
 from urllib.parse import urlparse
 import numpy as np
 
-from src.logging.logger import get_logger
+from common.logging.logger import get_logger
 from common.config import config
 from common.database import db
 from common.text_utils import extract_excerpt
 from common.summarizer import summarize_content
+from common.models import DocumentCreate
+from common.repositories import DocumentRepository
+from common.qdrant_manager import QdrantManager
 from curation.scoring import scorer
 from phase1_offline.fps_sampler import FarthestPointSampler
 from phase1_offline.deduplication import Deduplicator, compute_content_hash
@@ -167,43 +170,55 @@ class Writer:
     and writes to persistent storage.
     """
     
-    def __init__(self, embed_queue: Queue):
+    def __init__(
+        self,
+        embed_queue: Queue,
+        database=None,
+        qdrant_manager=None,
+        quality_scorer=None,
+        doc_repo=None,
+    ):
         if embed_queue is None:
             raise ValueError("embed_queue is required")
-        
+
         self.embed_queue = embed_queue
         self.running = False
-        
+
+        # DI
+        self._database = database or db
+        self._qdrant_mgr = qdrant_manager or QdrantManager(create_if_missing=True, timeout=5)
+        self._scorer = quality_scorer or scorer
+        self._doc_repo = doc_repo or DocumentRepository(self._database)
+
         # Database connection - created in start() for thread safety
         self.conn = None
-        self._db_path = config.get("database.sqlite_path", "data/atlas.db")
-        
+        self._db_path = self._database.db_path
+
         # Configuration
-        self.novelty_threshold = config.get("batch_processing.novelty_threshold", 0.08)
-        self.quality_threshold = config.get("batch_processing.quality_threshold", 0.3)
-        self.quality_alpha = config.get("batch_processing.quality_weight_alpha", 1.0)
-        
+        self.novelty_threshold = config.get("batch_processing.novelty_threshold")
+        self.quality_threshold = config.get("batch_processing.quality_threshold")
+        self.quality_alpha = config.get("batch_processing.quality_weight_alpha")
+
         # Initialize FPS sampler
         self.fps_sampler = FarthestPointSampler(
             quality_weight_alpha=self.quality_alpha,
             use_qdrant=False  # Use local for now
         )
-        
+
         # Initialize deduplicator
-        expected_docs = config.get("batch_processing.expected_documents", 1_000_000)
+        expected_docs = config.get("batch_processing.expected_documents")
         self.deduplicator = Deduplicator(expected_documents=expected_docs)
-        
+
         # Initialize archiver
-        archive_dir = config.get("paths.parsed_archive_dir", "data/parsed_archive")
+        archive_dir = config.get("paths.parsed_archive_dir")
         self.archiver = ContentArchiver(archive_dir)
-        
-        # Qdrant client
-        self.qdrant = None
-        self.qdrant_collection = config.get("qdrant.collection", "atlas_embeddings")
-        self._qdrant_available = False
+
+        # Backwards-compatible properties
+        self.qdrant = self._qdrant_mgr.client
+        self.qdrant_collection = self._qdrant_mgr.collection_name
+        self._qdrant_available = self._qdrant_mgr.available
         self._qdrant_error_logged = False
-        self._init_qdrant()
-        
+
         # Statistics
         self._stats = {
             'received': 0,
@@ -215,45 +230,9 @@ class Writer:
             'db_errors': 0,
             'qdrant_errors': 0,
         }
-        
+
         logger.info(f"Writer initialized (novelty_th={self.novelty_threshold}, "
                    f"quality_th={self.quality_threshold}, alpha={self.quality_alpha})")
-    
-    def _init_qdrant(self):
-        """Initializes Qdrant client and collection."""
-        try:
-            from qdrant_client import QdrantClient
-            from qdrant_client.models import Distance, VectorParams
-            
-            url = config.get("qdrant.url", "http://localhost:6333")
-            self.qdrant = QdrantClient(url=url, timeout=5)
-            
-            # Check/create collection
-            try:
-                self.qdrant.get_collection(self.qdrant_collection)
-                logger.info(f"Using existing Qdrant collection: {self.qdrant_collection}")
-                self._qdrant_available = True
-            except Exception:
-                try:
-                    logger.info(f"Creating Qdrant collection: {self.qdrant_collection}")
-                    self.qdrant.create_collection(
-                        collection_name=self.qdrant_collection,
-                        vectors_config=VectorParams(
-                            size=384,  # bge-small-en-v1.5 dimension
-                            distance=Distance.COSINE
-                        )
-                    )
-                    self._qdrant_available = True
-                except Exception as e:
-                    logger.warning(f"Qdrant not available: {e}. Running without vector search.")
-                    self.qdrant = None
-                
-        except ImportError:
-            logger.warning("qdrant-client not installed, running without vector search")
-            self.qdrant = None
-        except Exception as e:
-            logger.warning(f"Qdrant connection failed: {e}. Running without vector search.")
-            self.qdrant = None
     
     def start(self):
         """Main writer loop."""
@@ -315,8 +294,8 @@ class Writer:
         
         # 2. Compute quality score using calibrated weights
         content_type = self._detect_content_type(text, metadata)
-        raw_metrics = scorer.compute_raw_metrics(text, metadata)
-        quality_score = scorer.compute_score(raw_metrics, content_type)
+        raw_metrics = self._scorer.compute_raw_metrics(text, metadata)
+        quality_score = self._scorer.compute_score(raw_metrics, content_type)
         
         if quality_score < self.quality_threshold:
             self._stats['quality_rejected'] += 1
@@ -408,7 +387,7 @@ class Writer:
         if any(ind in url or ind in title for ind in news_indicators):
             return 'news'
         
-        return config.get("calibration.default_content_type", "default")
+        return config.get("calibration.default_content_type")
     
     def _save_to_db(
         self,
@@ -428,33 +407,25 @@ class Writer:
             summary = summarize_content(text, max_length=80)
             if not summary:
                 summary = extract_excerpt(text, max_words=80, prefer_first_paragraph=True)
-            
-            cursor = self.conn.cursor()
-            cursor.execute("""
-                INSERT OR IGNORE INTO documents 
-                (id, canonical_url, title, summary, content_hash, domain, 
-                 detected_content_type, quality_score, quality_components,
-                 quality_profile_used, raw_html_hash, novelty_distance,
-                 source_phase, content_length, created_at, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'active')
-            """, (
-                doc_id,
-                url,
-                metadata.get('title', ''),
-                summary,
-                hashlib.md5(text.encode()).hexdigest(),
-                self._get_domain(url),
-                content_type,
-                quality_score,
-                json.dumps(raw_metrics),
-                content_type,
-                raw_html_hash,
-                novelty_distance,
-                'batch',
-                len(text),
-            ))
-            self.conn.commit()
-            
+
+            doc = DocumentCreate(
+                id=doc_id,
+                url=url,
+                title=metadata.get('title', ''),
+                summary=summary,
+                content_hash=hashlib.md5(text.encode()).hexdigest(),
+                domain=self._get_domain(url),
+                content_type=content_type,
+                quality_score=quality_score,
+                quality_components=json.dumps(raw_metrics),
+                quality_profile_used=content_type,
+                raw_html_hash=raw_html_hash,
+                novelty_distance=novelty_distance,
+                source_phase='batch',
+                content_length=len(text),
+            )
+            self._doc_repo.insert(doc, conn=self.conn)
+
         except Exception as e:
             self._stats['db_errors'] += 1
             logger.error(f"Database write failed: {e}")
@@ -467,17 +438,16 @@ class Writer:
         quality_score: float
     ):
         """Saves embedding to Qdrant."""
-        if not self.qdrant or not self._qdrant_available:
+        if not self._qdrant_mgr.available:
             return
-        
+
         try:
             from qdrant_client.models import PointStruct
-            
+
             # Convert string doc_id to UUID for Qdrant
             qdrant_id = str(uuid.UUID(doc_id))
-            
-            self.qdrant.upsert(
-                collection_name=self.qdrant_collection,
+
+            self._qdrant_mgr.upsert(
                 points=[
                     PointStruct(
                         id=qdrant_id,
@@ -490,14 +460,13 @@ class Writer:
                     )
                 ]
             )
-            
+
         except Exception as e:
             self._stats['qdrant_errors'] += 1
             # Only log first error to avoid spam
             if not self._qdrant_error_logged:
                 logger.warning(f"Qdrant write failed (further errors suppressed): {e}")
                 self._qdrant_error_logged = True
-                self._qdrant_available = False
     
     def _get_domain(self, url: str) -> str:
         """Extracts domain from URL."""
@@ -547,47 +516,39 @@ class BatchWriter(Writer):
         """Flushes database write buffer."""
         if not self._db_buffer:
             return
-        
+
         try:
-            cursor = self.conn.cursor()
-            
+            docs = []
             for kwargs in self._db_buffer:
                 # Generate concise summary using LLM/ML model (falls back to excerpt)
                 summary = summarize_content(kwargs['text'], max_length=80)
                 if not summary:
                     summary = extract_excerpt(kwargs['text'], max_words=80, prefer_first_paragraph=True)
-                
-                cursor.execute("""
-                    INSERT OR IGNORE INTO documents 
-                    (id, canonical_url, title, summary, content_hash, domain, 
-                     detected_content_type, quality_score, quality_components,
-                     quality_profile_used, raw_html_hash, novelty_distance,
-                     source_phase, content_length, created_at, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'active')
-                """, (
-                    kwargs['doc_id'],
-                    kwargs['url'],
-                    kwargs['metadata'].get('title', ''),
-                    summary,
-                    hashlib.md5(kwargs['text'].encode()).hexdigest(),
-                    self._get_domain(kwargs['url']),
-                    kwargs['content_type'],
-                    kwargs['quality_score'],
-                    json.dumps(kwargs['raw_metrics']),
-                    kwargs['content_type'],
-                    kwargs['raw_html_hash'],
-                    kwargs['novelty_distance'],
-                    'batch',
-                    len(kwargs['text']),
+
+                docs.append(DocumentCreate(
+                    id=kwargs['doc_id'],
+                    url=kwargs['url'],
+                    title=kwargs['metadata'].get('title', ''),
+                    summary=summary,
+                    content_hash=hashlib.md5(kwargs['text'].encode()).hexdigest(),
+                    domain=self._get_domain(kwargs['url']),
+                    content_type=kwargs['content_type'],
+                    quality_score=kwargs['quality_score'],
+                    quality_components=json.dumps(kwargs['raw_metrics']),
+                    quality_profile_used=kwargs['content_type'],
+                    raw_html_hash=kwargs['raw_html_hash'],
+                    novelty_distance=kwargs['novelty_distance'],
+                    source_phase='batch',
+                    content_length=len(kwargs['text']),
                 ))
-            
-            self.conn.commit()
+
+            self._doc_repo.insert_batch(docs, conn=self.conn)
             logger.debug(f"Flushed {len(self._db_buffer)} records to database")
-            
+
         except Exception as e:
             self._stats['db_errors'] += len(self._db_buffer)
             logger.error(f"Batch database write failed: {e}")
-        
+
         self._db_buffer = []
     
     def _on_shutdown(self):

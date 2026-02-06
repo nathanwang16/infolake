@@ -25,7 +25,7 @@ from queue import Queue, Empty
 from typing import Optional, Dict, Any, List, Tuple
 import numpy as np
 
-from src.logging.logger import get_logger
+from common.logging.logger import get_logger
 from common.config import config
 
 logger = get_logger("worker")
@@ -53,8 +53,8 @@ def get_embedding_model():
         try:
             from sentence_transformers import SentenceTransformer
             
-            model_name = config.get("embedding.model", "BAAI/bge-small-en-v1.5")
-            device = config.get("embedding.device", "cpu")
+            model_name = config.get("embedding.model")
+            device = config.get("embedding.device")
             
             logger.info(f"Loading embedding model {model_name} on {device}...")
             _embedding_model = SentenceTransformer(model_name, device=device)
@@ -99,12 +99,14 @@ class ContentExtractor:
             self._trafilatura = trafilatura
         except ImportError:
             logger.warning("trafilatura not installed")
+            raise ImportError()
         
         try:
             from readability import Document
             self._readability = Document
         except ImportError:
             logger.warning("readability-lxml not installed")
+            
     
     def extract(self, html: str, url: str) -> Tuple[Optional[str], Dict[str, Any]]:
         """
@@ -328,14 +330,14 @@ class BatchWorker(threading.Thread):
         self.embed_batch_queue = embed_batch_queue  # Shared queue for batch embedding
         
         # Read all params from config
-        self.batch_size = batch_size or config.get("batch_processing.worker_batch_size", 32)
-        self.max_retries = max_retries or config.get("batch_processing.max_retries", 3)
+        self.batch_size = batch_size or config.get("batch_processing.worker_batch_size")
+        self.max_retries = max_retries or config.get("batch_processing.max_retries")
         
         self.running = True
         self.daemon = True
         
         # Components - read config
-        target_lang = config.get("language.target", "en")
+        target_lang = config.get("language.target")
         self.extractor = ContentExtractor()
         self.language_detector = LanguageDetector(target_language=target_lang)
         self.content_filter = ContentFilter()
@@ -578,7 +580,7 @@ class ConcurrentEmbedder(threading.Thread):
         
         self.input_queue = input_queue
         self.output_queue = output_queue
-        self.batch_size = batch_size or config.get("embedding.batch_size", 32)
+        self.batch_size = batch_size or config.get("embedding.batch_size")
         self.batch_timeout = batch_timeout
         self.running = True
         self._draining = False  # Flag for draining mode
@@ -686,7 +688,7 @@ class WorkerPool:
             raise ValueError("embed_queue is required")
         
         # Read from config
-        num_workers = num_workers or config.get("batch_processing.workers", 8)
+        num_workers = num_workers or config.get("batch_processing.workers")
         
         # Shared queue for items ready to embed
         self.pre_embed_queue: Queue = Queue(maxsize=1000)

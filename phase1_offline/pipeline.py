@@ -27,7 +27,7 @@ from pathlib import Path
 from queue import Queue
 from typing import Dict, Any, List, Optional
 
-from src.logging.logger import get_logger, setup_logger
+from common.logging.logger import get_logger, setup_logger
 from common.config import config
 from common.database import db
 from phase1_offline.producer import Producer, MultiProducer
@@ -162,12 +162,12 @@ class BatchPipeline:
         self.dump_path = Path(dump_path)
         self.additional_dumps = additional_dumps or []
         self.all_dump_paths = [str(self.dump_path)] + self.additional_dumps
-        self.num_workers = num_workers or config.get("batch_processing.workers", 4)
+        self.num_workers = num_workers or config.get("batch_processing.workers")
         self.limit = limit
-        
+
         # Queue configuration
-        self.url_queue_size = url_queue_size or config.get("batch_processing.url_queue_size", 10000)
-        self.embed_queue_size = embed_queue_size or config.get("batch_processing.embed_queue_size", 5000)
+        self.url_queue_size = url_queue_size or config.get("batch_processing.url_queue_size")
+        self.embed_queue_size = embed_queue_size or config.get("batch_processing.embed_queue_size")
         
         # Components (initialized in setup)
         self.url_queue: Optional[Queue] = None
@@ -469,7 +469,7 @@ Examples:
     parser.add_argument(
         "--workers",
         type=int,
-        default=config.get("batch_processing.workers", 4),
+        default=config.get("batch_processing.workers"),
         help="Number of worker threads"
     )
     parser.add_argument(
@@ -489,13 +489,13 @@ Examples:
     parser.add_argument(
         "--url-queue-size",
         type=int,
-        default=config.get("batch_processing.url_queue_size", 10000),
+        default=config.get("batch_processing.url_queue_size"),
         help="URL queue capacity"
     )
     parser.add_argument(
         "--embed-queue-size",
         type=int,
-        default=config.get("batch_processing.embed_queue_size", 5000),
+        default=config.get("batch_processing.embed_queue_size"),
         help="Embedding queue capacity"
     )
     

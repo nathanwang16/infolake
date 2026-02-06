@@ -19,9 +19,11 @@ from queue import Queue
 from typing import Optional, Set, Dict, Any, List
 from urllib.parse import urlparse
 
-from src.logging.logger import get_logger
+from common.logging.logger import get_logger
 from common.config import config
 from common.database import db
+from common.models import DumpJob
+from common.repositories import JobRepository
 from phase1_offline.dump_adapters import adapter_registry, DumpRecord
 from phase1_offline.deduplication import BloomFilter, URLCanonicalizer
 
@@ -185,19 +187,25 @@ class Producer:
         dump_path: str,
         job_id: Optional[str] = None,
         limit: int = 0,
-        expected_urls: int = 1_000_000
+        expected_urls: int = 1_000_000,
+        database=None,
+        job_repo=None,
     ):
         if url_queue is None:
             raise ValueError("url_queue is required")
         if dump_path is None:
             raise ValueError("dump_path is required")
-        
+
         self.url_queue = url_queue
         self.dump_path = Path(dump_path)
         self.job_id = job_id or str(uuid.uuid4())[:8]
         self.limit = limit
         self.running = False
-        
+
+        # DI
+        self._database = database or db
+        self._job_repo = job_repo or JobRepository(self._database)
+
         # Initialize components
         self.url_filter = URLFilter()
         self.bloom_filter = BloomFilter(expected_urls)
@@ -289,39 +297,26 @@ class Producer:
     def _register_job(self):
         """Registers the processing job in the database."""
         try:
-            conn = db.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT OR REPLACE INTO dump_processing_jobs 
-                (id, dump_name, dump_path, status, started_at)
-                VALUES (?, ?, ?, 'running', CURRENT_TIMESTAMP)
-            """, (self.job_id, self.dump_path.name, str(self.dump_path)))
-            conn.commit()
+            job = DumpJob(
+                id=self.job_id,
+                dump_name=self.dump_path.name,
+                dump_path=str(self.dump_path),
+            )
+            self._job_repo.register_job(job)
         except Exception as e:
             logger.warning(f"Failed to register job: {e}")
-    
+
     def _finalize_job(self, success: bool, error: Optional[str] = None):
         """Updates job status in database."""
         try:
-            conn = db.get_connection()
-            cursor = conn.cursor()
             status = 'completed' if success else 'failed'
-            cursor.execute("""
-                UPDATE dump_processing_jobs 
-                SET status = ?, 
-                    total_urls = ?,
-                    filtered_urls = ?,
-                    completed_at = CURRENT_TIMESTAMP,
-                    error_message = ?
-                WHERE id = ?
-            """, (
-                status,
-                self._stats['total_records'],
-                self._stats['queued'],
-                error,
-                self.job_id
-            ))
-            conn.commit()
+            self._job_repo.finalize_job(
+                job_id=self.job_id,
+                status=status,
+                total_urls=self._stats['total_records'],
+                filtered_urls=self._stats['queued'],
+                error=error,
+            )
         except Exception as e:
             logger.warning(f"Failed to finalize job: {e}")
     

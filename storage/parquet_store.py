@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 
-from src.logging.logger import get_logger
+from common.logging.logger import get_logger
 from common.config import config
 
 logger = get_logger("parquet_store")
@@ -38,7 +38,7 @@ class ParquetStore:
     """
     
     def __init__(self, base_dir: Optional[str] = None):
-        self.base_dir = Path(base_dir or config.get("paths.data_dir", "data")) / "exports"
+        self.base_dir = Path(base_dir or config.get("paths.data_dir")) / "exports"
         self.base_dir.mkdir(parents=True, exist_ok=True)
         
         # Subdirectories

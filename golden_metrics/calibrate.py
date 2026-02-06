@@ -8,8 +8,10 @@ from collections import defaultdict
 import numpy as np
 from common.database import db
 from common.config import config
+from common.models import GoldenSetEntry
+from common.repositories import GoldenSetRepository
 from curation.scoring import scorer
-from src.logging.logger import get_logger
+from common.logging.logger import get_logger
 
 # specific logging for calibration
 logger = get_logger("calibration")
@@ -24,25 +26,18 @@ def process_url_task(row_data, index, total_rows):
     Must be top-level for multiprocessing picklability.
     """
     # Re-import logger here to ensure it works in subprocess
-    from src.logging.logger import get_logger
+    from common.logging.logger import get_logger
     from curation.scoring import scorer
     import trafilatura
-    # Import our new fetcher
-    from src.crawling.fetcher import fetch_with_playwright
-    
-    # Simple console logging for process safety
-    # logger = get_logger("calibration_worker") 
-    # Using print for immediate feedback in subprocess is safer than logging config issues
-    
+    import requests
+
     url = row_data['url'].strip()
     if not url: return None
-    
-    # print(f"Processing {url}...") 
-    
+
     label_raw = row_data['label'].strip().lower()
     content_type = row_data.get('content_type', 'default').strip() or 'default'
     notes = row_data.get('notes', '').strip()
-    
+
     # Normalize label
     try:
         if label_raw.isdigit():
@@ -53,29 +48,33 @@ def process_url_task(row_data, index, total_rows):
             label_val = 1
         else:
             return None # Skip invalid
-            
+
         if not (1 <= label_val <= 5):
             return None # Skip out of range
-            
+
     except ValueError:
             return None # Skip parse error
-    
+
     # Fetch and score
     metrics = {}
     domain = ""
     first_sentence = None
-    
+
     try:
-        # Use Playwright for fetching
-        downloaded = fetch_with_playwright(url)
-        
+        # Use requests for fetching
+        response = requests.get(url, timeout=30, headers={
+            'User-Agent': 'TruthAtlas/1.0 (Research Crawler)',
+            'Accept': 'text/html,application/xhtml+xml'
+        })
+        downloaded = response.text if response.status_code == 200 else None
+
         if downloaded:
             # Pass HTML string directly to extract
             text = trafilatura.extract(downloaded) or ""
             if text:
                 sentences = text.split('.')
                 first_sentence = sentences[0].strip() if sentences else text[:50]
-            
+
             # extract_metadata expects HTML string too
             metadata = trafilatura.extract_metadata(downloaded)
             meta_dict = metadata.as_dict() if metadata else {}
@@ -93,9 +92,6 @@ def process_url_task(row_data, index, total_rows):
         raw_metrics = scorer.compute_raw_metrics(text, meta_dict)
         domain = scorer._get_domain(url)
     except Exception as e:
-        # If scoring fails, just return what we have or None
-        # But we need metrics to write to DB
-        # If compute_raw_metrics fails (e.g. strict checks), we might want to skip
         print(f"Scoring failed for {url}: {e}")
         return None
 
@@ -112,8 +108,11 @@ def process_url_task(row_data, index, total_rows):
     }
 
 class Calibrator:
-    def __init__(self):
-        self.conn = db.get_connection()
+    def __init__(self, database=None, quality_scorer=None, golden_set_repo=None):
+        self._database = database or db
+        self._scorer = quality_scorer or scorer
+        self._golden_set_repo = golden_set_repo or GoldenSetRepository(self._database)
+        self.conn = self._database.get_connection()
 
     def import_from_csv(self, csv_path: str):
         """
@@ -123,7 +122,7 @@ class Calibrator:
         """
         import csv
         import concurrent.futures
-        
+
         try:
             # First pass to count total rows for logging
             total_rows = 0
@@ -133,15 +132,15 @@ class Calibrator:
 
             with open(csv_path, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
-                
+
                 # Check for required columns
                 required = {'url', 'label'}
                 if not required.issubset(reader.fieldnames):
                     raise ValueError(f"CSV missing required columns: {required - set(reader.fieldnames)}")
-                
+
                 success_count = 0
                 tasks = []
-                
+
                 # Use ProcessPoolExecutor to avoid GIL/malloc double free issues with lxml
                 # Reduced max_workers to 4 to be safe with memory
                 with concurrent.futures.ProcessPoolExecutor(max_workers=8) as executor:
@@ -149,19 +148,19 @@ class Calibrator:
                         # Convert row to dict to ensure picklability
                         row_dict = dict(row)
                         tasks.append(executor.submit(process_url_task, row_dict, i, total_rows))
-                    
+
                     for future in concurrent.futures.as_completed(tasks):
                         try:
                             result = future.result()
                             if result:
                                 logger.info(f"Processing URL {result['index']}/{total_rows}: {result['url']}")
-                                
+
                                 # DB Write (sequential in main thread)
                                 try:
                                     self._write_entry(
-                                        result["url"], 
-                                        result["label"], 
-                                        result["content_type"], 
+                                        result["url"],
+                                        result["label"],
+                                        result["content_type"],
                                         result["notes"],
                                         result["metrics"],
                                         result["domain"]
@@ -176,46 +175,41 @@ class Calibrator:
                             logger.error(f"Task failed: {e}")
 
                 logger.info(f"Successfully imported {success_count} entries from {csv_path}")
-                
+
         except Exception as e:
             logger.error(f"CSV import failed: {e}")
             raise
 
     # _fetch_and_compute removed as it's now in process_url_task
-    
+
     def _write_entry(self, url: str, label: int, content_type: str, notes: str, raw_metrics: dict, domain: str):
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            INSERT INTO golden_set (url, label, content_type, raw_metrics, notes, version, domain)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(url) DO UPDATE SET 
-                label=excluded.label,
-                content_type=excluded.content_type,
-                notes=excluded.notes,
-                raw_metrics=excluded.raw_metrics,
-                domain=excluded.domain
-        """, (url, str(label), content_type, json.dumps(raw_metrics), notes, 1, domain))
-        self.conn.commit()
+        entry = GoldenSetEntry(
+            url=url,
+            label=str(label),
+            content_type=content_type,
+            notes=notes,
+            raw_metrics=json.dumps(raw_metrics),
+            version=1,
+            domain=domain,
+        )
+        self._golden_set_repo.upsert(entry)
 
     # _add_entry removed
-    
+
     def add_to_golden_set(self, url: str, label: str, content_type: str = "default", notes: str = ""):
         """
         Legacy wrapper for CLI compatibility.
         """
-        # Convert simple call to use process_url_task style logic or just call it directly since it's single
-        # But wait, process_url_task is top-level. 
-        # We can just run it synchronously here.
         row_data = {"url": url, "label": label, "content_type": content_type, "notes": notes}
-        
+
         # We need to map string labels to int
         if label == "exemplary":
             row_data["label"] = "5"
         elif label == "garbage":
             row_data["label"] = "1"
-            
+
         result = process_url_task(row_data, 1, 1)
-        
+
         if result:
             self._write_entry(result["url"], result["label"], result["content_type"], result["notes"], result["metrics"], result["domain"])
             logger.info(f"Added {url} to golden set (label={label})")
@@ -233,49 +227,39 @@ class Calibrator:
             logger.error("scikit-learn not installed. Cannot train weights.")
             return
 
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT label, raw_metrics, domain FROM golden_set 
-            WHERE content_type = ? AND raw_metrics IS NOT NULL
-        """, (content_type,))
-        
-        rows = cursor.fetchall()
-        
+        rows = self._golden_set_repo.get_for_training(content_type)
+
         # Filter for exemplary (5) and garbage (1) only for training, as per guide
         training_samples = []
-        for label_str, metrics_json, domain in rows:
+        for label_str, metrics, domain in rows:
             label_val = int(label_str)
             if label_val == 5 or label_val == 1:
-                metrics = json.loads(metrics_json)
                 training_samples.append({
                     "label": 1.0 if label_val == 5 else 0.0,
                     "metrics": metrics,
                     "domain": domain
                 })
 
-        if len(training_samples) < 10: 
+        if len(training_samples) < 10:
             logger.warning(f"Not enough exemplary/garbage samples for {content_type} to train (found {len(training_samples)})")
             return
 
         # Topic-Cluster CV: Split by domain (Simple shuffle split for now)
         domains = list(set(s["domain"] for s in training_samples))
         random.shuffle(domains)
-        
+
         # Use all data for training final weights, but could do CV for evaluation.
-        # Here we just train on all available filtered data.
-        
         train_set = training_samples
 
         if not train_set:
             logger.warning("Train set empty.")
             return
 
-        feature_names = scorer.METRICS
+        feature_names = self._scorer.METRICS
         X_train = [[s["metrics"].get(f, 0.0) for f in feature_names] for s in train_set]
         y_train = [s["label"] for s in train_set]
 
         # Use Lasso Regression with L1 penalty and positive constraint
-        # alpha controls regularization strength. 0.01 is a reasonable starting point.
         model = Lasso(alpha=0.001, fit_intercept=False, positive=True, random_state=42)
         try:
              model.fit(X_train, y_train)
@@ -286,17 +270,17 @@ class Calibrator:
         coefs = model.coef_
         new_weights = {}
         total = sum(abs(c) for c in coefs)
-        
+
         if total > 0:
             for name, coef in zip(feature_names, coefs):
-                if abs(coef) > 0.0001: 
+                if abs(coef) > 0.0001:
                     new_weights[name] = abs(coef) / total # Normalize to sum to 1
         else:
              logger.warning("All coefficients zero, keeping default weights.")
              return
-        
+
         logger.info(f"New calibrated weights for {content_type}: {new_weights}")
-        scorer.update_weights(content_type, new_weights)
+        self._scorer.update_weights(content_type, new_weights)
         return new_weights
 
     def compute_qadi(self, confusion_matrix: np.ndarray) -> Dict[str, float]:
@@ -309,14 +293,14 @@ class Calibrator:
 
         row_sums = confusion_matrix.sum(axis=1) # Actual
         col_sums = confusion_matrix.sum(axis=0) # Predicted
-        
+
         # Quantity disagreement
         Q = sum(abs(row_sums[i] - col_sums[i]) for i in range(len(row_sums))) / (2 * n)
-        
+
         # Allocation disagreement
         diagonal = sum(confusion_matrix[i, i] for i in range(len(row_sums)))
         A = (n - diagonal) / n - Q
-        
+
         qadi_score = math.sqrt(Q**2 + A**2)
         return {"qadi": qadi_score, "quantity": Q, "allocation": A}
 
@@ -324,25 +308,18 @@ class Calibrator:
         """
         Validates the separation and computes QADI metrics.
         """
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT label, raw_metrics FROM golden_set 
-            WHERE content_type = ? AND raw_metrics IS NOT NULL
-        """, (content_type,))
-        
-        rows = cursor.fetchall()
-        
+        rows = self._golden_set_repo.get_for_validation(content_type)
+
         y_true = []
         y_pred = []
-        
+
         exemplary_scores = []
         garbage_scores = []
 
-        for label_str, metrics_json in rows:
+        for label_str, metrics in rows:
             label_val = int(label_str)
-            metrics = json.loads(metrics_json)
-            score = scorer.compute_score(metrics, content_type)
-            
+            score = self._scorer.compute_score(metrics, content_type)
+
             # Binary classification for QADI: Good (>=4) vs Bad (<=2). Ignore 3.
             if label_val >= 4:
                 y_true.append(1)
@@ -368,17 +345,17 @@ class Calibrator:
                 from sklearn.metrics import confusion_matrix
                 cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
                 qadi_res = self.compute_qadi(cm)
-                
+
                 logger.info(f"QADI Metrics for {content_type}:")
                 logger.info(f"  Score: {qadi_res['qadi']:.3f} (Lower is better)")
                 logger.info(f"  Quantity Disagreement: {qadi_res['quantity']:.3f}")
                 logger.info(f"  Allocation Disagreement: {qadi_res['allocation']:.3f}")
-                
+
                 if qadi_res['qadi'] < 0.3:
                     logger.info("QADI verification passed (< 0.3).")
                 else:
                     logger.warning("QADI verification failed (> 0.3). Recalibration recommended.")
-                    
+
             except ImportError:
                 logger.warning("sklearn not available for QADI confusion matrix.")
 
@@ -392,17 +369,17 @@ def main():
     parser.add_argument("--train-weights", action="store_true", help="Train weights based on golden set")
     parser.add_argument("--validate", action="store_true", help="Validate current weights")
     parser.add_argument("--qadi-report", action="store_true", help="Report QADI metrics (alias for --validate)")
-    
+
     parser.add_argument("--import-csv", help="Path to CSV file to import golden set from")
-    
+
     args = parser.parse_args()
-    
+
     # Defaults from config
     csv_path = args.import_csv or config.get("calibration.csv_path")
-    content_type = args.content_type or config.get("calibration.default_content_type", "default")
-    
+    content_type = args.content_type or config.get("calibration.default_content_type")
+
     calibrator = Calibrator()
-    
+
     # If explicit CSV arg is provided, or if we want to ensure import happens before training
     if args.import_csv:
         calibrator.import_from_csv(args.import_csv)
@@ -410,22 +387,16 @@ def main():
         # If no action specified but CSV is in config, run import
         logger.info(f"No action specified. Importing from config CSV: {csv_path}")
         calibrator.import_from_csv(csv_path)
-    
+
     if args.add_exemplary:
         calibrator.add_to_golden_set(args.add_exemplary, "exemplary", content_type, args.notes)
 
     if args.add_garbage:
         calibrator.add_to_golden_set(args.add_garbage, "garbage", content_type, args.notes)
-        
+
     if args.train_weights:
-        # If using config CSV and it hasn't been imported in this run, maybe we should?
-        # But maybe it was imported before. 
-        # For this task, I will ensure import runs if I call train_weights? 
-        # No, keep it separate or user explicit.
-        # But wait, I need to "Run the calibration script to find the best parameters".
-        # I will run import first then train in my shell commands.
         calibrator.train_weights(content_type)
-        
+
     if args.validate or args.qadi_report:
         calibrator.validate(content_type)
 

@@ -1,20 +1,40 @@
 import os
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Optional
 from common.config import config
-from src.logging.logger import get_logger
+from common.logging.logger import get_logger
 
 logger = get_logger("database")
 
 class Database:
-    def __init__(self):
-        # Convert to absolute path to avoid issues with relative paths in threads
-        raw_path = config.get("database.sqlite_path", "data/atlas.db")
-        self.db_path = os.path.abspath(raw_path)
+    def __init__(self, db_path: Optional[str] = None):
+        if db_path is None:
+            # Convert to absolute path to avoid issues with relative paths in threads
+            raw_path = config.get("database.sqlite_path")
+            self.db_path = os.path.abspath(raw_path)
+        elif db_path == ":memory:":
+            self.db_path = ":memory:"
+        else:
+            self.db_path = os.path.abspath(db_path)
         self._init_db()
 
     def get_connection(self):
         return sqlite3.connect(self.db_path)
+
+    @contextmanager
+    def connection(self):
+        """Context manager that provides a connection with automatic commit/rollback."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def _init_db(self):
         """Initialize the database schema."""

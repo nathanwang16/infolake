@@ -22,7 +22,7 @@ from typing import List, Optional, Set, Tuple, Dict, Any
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 import numpy as np
 
-from src.logging.logger import get_logger
+from common.logging.logger import get_logger
 from common.config import config
 
 logger = get_logger("deduplication")
@@ -338,13 +338,13 @@ class Deduplicator:
         
         # Load thresholds from config if not provided
         self.simhash_threshold = simhash_threshold or config.get(
-            "deduplication.simhash_threshold", 3
+            "deduplication.simhash_threshold"
         )
         self.minhash_threshold = minhash_threshold or config.get(
-            "deduplication.minhash_jaccard_threshold", 0.5
+            "deduplication.minhash_jaccard_threshold"
         )
         self.embedding_threshold = embedding_threshold or config.get(
-            "deduplication.embedding_similarity_threshold", 0.95
+            "deduplication.embedding_similarity_threshold"
         )
         
         # Initialize components

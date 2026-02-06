@@ -23,7 +23,7 @@ from typing import Dict, Any, Optional
 from urllib.parse import urlparse, parse_qs
 import threading
 
-from src.logging.logger import get_logger, setup_logger
+from common.logging.logger import get_logger, setup_logger
 from common.config import config
 from storage.atlas_store import AtlasStore
 
@@ -48,7 +48,12 @@ class AtlasAPIHandler(SimpleHTTPRequestHandler):
         GET /static/*           - Static assets (CSS, JS)
     """
     
-    # Class-level store (shared across requests)
+    # Class-level state (shared across requests).
+    # NOTE: SimpleHTTPRequestHandler creates a new instance per request, so instance
+    # attributes are lost between requests.  Class-level attributes are the standard
+    # pattern for sharing state (like `store`) across requests with the stdlib
+    # http.server module.  If the server needs to handle concurrent requests or
+    # per-request isolation, migrate to a WSGI/ASGI framework (e.g. Flask, FastAPI).
     store: Optional[AtlasStore] = None
     static_dir: Optional[Path] = None
     
@@ -184,7 +189,7 @@ class AtlasAPIHandler(SimpleHTTPRequestHandler):
         # Fall back to JSON file
         if not mappings:
             try:
-                mappings_path = config.get("mapping.output_path", "./data/mappings/latest.json")
+                mappings_path = config.get("mapping.output_path")
                 mappings_path = Path(mappings_path).resolve()
                 if mappings_path.exists():
                     with open(mappings_path) as f:
@@ -207,34 +212,13 @@ class AtlasAPIHandler(SimpleHTTPRequestHandler):
         """GET /api/search - Search documents by text query."""
         query = params.get('q', '')
         limit = int(params.get('limit', 20))
-        
+
         if not query:
             self._send_error(400, "Query parameter 'q' is required")
             return
-        
-        # Simple text search in SQLite (for MVP)
-        conn = self.store.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT id, canonical_url, title, domain, quality_score
-            FROM documents
-            WHERE status = 'active' 
-            AND (title LIKE ? OR canonical_url LIKE ?)
-            ORDER BY quality_score DESC
-            LIMIT ?
-        """, (f'%{query}%', f'%{query}%', limit))
-        
-        results = []
-        for row in cursor.fetchall():
-            results.append({
-                'id': row[0],
-                'url': row[1],
-                'title': row[2],
-                'domain': row[3],
-                'quality_score': row[4],
-            })
-        
+
+        results = self.store.search_text_documents(query, limit)
+
         self._send_json({
             'query': query,
             'results': results,
@@ -253,26 +237,27 @@ class AtlasServer:
         self,
         host: str = 'localhost',
         port: int = 8080,
-        static_dir: Optional[str] = None
+        static_dir: Optional[str] = None,
+        store: Optional[AtlasStore] = None,
     ):
         self.host = host
         self.port = port
-        
+
         # Static files directory
         if static_dir:
             self.static_dir = Path(static_dir).resolve()
         else:
             # Use default visualizer/static (absolute path)
             self.static_dir = (Path(__file__).parent / 'static').resolve()
-        
+
         # Ensure static dir exists
         self.static_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Generate default index.html if not exists
         self._ensure_static_files()
-        
+
         # Initialize store
-        self.store = AtlasStore()
+        self.store = store or AtlasStore()
         
         # Configure handler
         AtlasAPIHandler.store = self.store

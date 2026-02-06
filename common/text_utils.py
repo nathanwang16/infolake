@@ -9,7 +9,7 @@ Provides:
 import re
 from typing import Optional
 
-from src.logging.logger import get_logger
+from common.logging.logger import get_logger
 
 logger = get_logger("text_utils")
 
