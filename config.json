@@ -81,7 +81,7 @@
         "output_format": "json",
         "output_path": "/Volumes/Lemon T9/atlas/mappings/latest.json",
         "umap": {
-            "neighbors": 15,
+            "neighbors": 50,
             "min_dist": 0.1,
             "metric": "cosine"
         },

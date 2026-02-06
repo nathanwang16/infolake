@@ -4,7 +4,20 @@
       "Bash(find:*)",
       "Bash(grep:*)",
       "Bash(python:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(curl:*)",
+      "Bash(echo:*)",
+      "Bash(brew list:*)",
+      "Bash(pip3 list:*)",
+      "Bash(docker volume ls:*)",
+      "Bash(mdfind:*)",
+      "Bash(conda list:*)",
+      "Bash(conda run:*)",
+      "Bash(conda activate:*)",
+      "Bash(/opt/homebrew/Caskroom/miniforge/base/envs/infolake/bin/python:*)",
+      "Bash(lsof:*)",
+      "Bash(orbctl list:*)",
+      "Bash(orb list:*)"
     ]
   }
 }

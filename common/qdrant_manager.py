@@ -78,7 +78,6 @@ class QdrantManager:
                         self._client = None
                 else:
                     logger.warning(f"Qdrant collection '{self._collection}' not found")
-                    self._client = None
 
         except ImportError:
             logger.warning("qdrant-client not installed, running without vector search")

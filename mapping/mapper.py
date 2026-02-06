@@ -254,8 +254,12 @@ class AtlasMapper:
         Returns:
             Number of embeddings loaded
         """
+        if not self._qdrant_mgr.client:
+            raise RuntimeError("Qdrant server not reachable")
+
         if not self._qdrant_mgr.available:
-            raise RuntimeError("Qdrant client not available")
+            logger.warning("Qdrant collection not found — no embeddings to load")
+            return 0
 
         logger.info("Loading embeddings from Qdrant...")
 
