@@ -26,6 +26,7 @@ from common.database import db as _default_db
 from common.repositories import DocumentRepository, DocumentTextRepository
 from common.qdrant_manager import QdrantManager
 from curation.scoring import scorer as _default_scorer
+from curation.scoring.detection import RuleBasedContentTypeDetector
 from phase1_offline.deduplication import Deduplicator, compute_content_hash
 from phase1_offline.fps_sampler import FarthestPointSampler
 
@@ -42,12 +43,14 @@ class PostProcessor:
         quality_scorer=None,
         doc_repo=None,
         text_repo=None,
+        content_type_detector=None,
     ):
         self._database = database or _default_db
         self._qdrant_mgr = qdrant_manager or QdrantManager(create_if_missing=False, timeout=5)
         self._scorer = quality_scorer or _default_scorer
         self._doc_repo = doc_repo or DocumentRepository(self._database)
         self._text_repo = text_repo or DocumentTextRepository(self._database)
+        self._detector = content_type_detector or RuleBasedContentTypeDetector()
 
         # Configuration
         self.quality_threshold = config.get("batch_processing.quality_threshold")
@@ -160,7 +163,7 @@ class PostProcessor:
             }
 
         # 1. Detect content type
-        content_type = self._detect_content_type(text, metadata)
+        content_type = self._detector.detect(text, metadata)
 
         # 2. Compute quality score
         raw_metrics = self._scorer.compute_raw_metrics(text, metadata)
@@ -195,25 +198,6 @@ class PostProcessor:
             self._stats['quality_rejected'] += 1
         else:
             self._stats['accepted'] += 1
-
-    def _detect_content_type(self, text: str, metadata: Dict) -> str:
-        """Detects content type for calibrated scoring."""
-        url = (metadata.get('url') or '').lower()
-        title = (metadata.get('title') or '').lower()
-
-        code_indicators = ['documentation', 'docs', 'api', 'reference', 'tutorial']
-        if any(ind in url or ind in title for ind in code_indicators):
-            return 'technical_code'
-
-        academic_indicators = ['arxiv', 'journal', 'research', 'paper', 'study']
-        if any(ind in url or ind in title for ind in academic_indicators):
-            return 'academic'
-
-        news_indicators = ['news', 'article', 'breaking', 'report']
-        if any(ind in url or ind in title for ind in news_indicators):
-            return 'news'
-
-        return config.get("calibration.default_content_type")
 
     def _update_document_score(
         self,
