@@ -110,14 +110,14 @@ class DocumentCreate:
     summary: str
     content_hash: str
     domain: str
-    content_type: str
-    quality_score: float
-    quality_components: str  # JSON string
-    quality_profile_used: str
-    raw_html_hash: str
-    novelty_distance: float
-    source_phase: str
-    content_length: int
+    content_type: str = 'unscored'
+    quality_score: float = 0.0
+    quality_components: str = '{}'  # JSON string
+    quality_profile_used: str = 'pending'
+    raw_html_hash: str = ''
+    novelty_distance: float = 0.0
+    source_phase: str = 'batch'
+    content_length: int = 0
 
 
 @dataclass

@@ -207,13 +207,11 @@ class Producer:
         self._job_repo = job_repo or JobRepository(self._database)
 
         # Initialize components
-        self.url_filter = URLFilter()
         self.bloom_filter = BloomFilter(expected_urls)
-        
+
         # Statistics
         self._stats = {
             'total_records': 0,
-            'filtered_out': 0,
             'duplicates': 0,
             'queued': 0,
             'with_html': 0,
@@ -237,12 +235,7 @@ class Producer:
                     break
                 
                 self._stats['total_records'] += 1
-                
-                # Apply URL filter
-                if not self.url_filter.is_allowed(record.url):
-                    self._stats['filtered_out'] += 1
-                    continue
-                
+
                 # Canonicalize URL
                 canonical_url = URLCanonicalizer.canonicalize(record.url)
                 
@@ -272,8 +265,7 @@ class Producer:
                 # Progress logging
                 if self._stats['queued'] % 1000 == 0:
                     logger.info(f"Queued {self._stats['queued']} URLs "
-                               f"(filtered={self._stats['filtered_out']}, "
-                               f"dupes={self._stats['duplicates']})")
+                               f"(dupes={self._stats['duplicates']})")
                 
                 # Check limit
                 if self.limit > 0 and self._stats['queued'] >= self.limit:
@@ -324,7 +316,6 @@ class Producer:
         """Returns producer statistics."""
         return {
             **self._stats,
-            'filter_stats': self.url_filter.get_stats(),
             'bloom_filter_size': len(self.bloom_filter),
         }
 
@@ -357,7 +348,6 @@ class MultiProducer:
         # Shared deduplication across dumps
         total_expected = len(dump_paths) * 1_000_000
         self.bloom_filter = BloomFilter(total_expected)
-        self.url_filter = URLFilter()
         
         self._total_queued = 0
         self.running = False
@@ -385,7 +375,6 @@ class MultiProducer:
             
             # Share deduplication state
             producer.bloom_filter = self.bloom_filter
-            producer.url_filter = self.url_filter
             
             try:
                 producer.start()

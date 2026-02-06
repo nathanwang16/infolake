@@ -49,6 +49,13 @@ CONFIG_SCHEMA: Dict[str, tuple] = {
     "batch_processing.expected_documents":      (int,   1_000_000),
     "batch_processing.limit":                   (int,   0),
     "batch_processing.max_retries":             (int,   3),
+    "batch_processing.fetch_concurrency":       (int,   100),
+    "batch_processing.fetch_timeout":           (int,   15),
+    "batch_processing.use_playwright":          (bool,  False),
+    "batch_processing.playwright_concurrency":  (int,   4),
+    "batch_processing.extract_processes":       (int,   8),
+    "batch_processing.skip_scoring":            (bool,  True),
+    "batch_processing.skip_url_filter":         (bool,  True),
 
     # Content extraction
     "content_extraction.extractor":             (str,   "trafilatura"),

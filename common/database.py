@@ -186,6 +186,13 @@ class Database:
             FOREIGN KEY(document_id) REFERENCES documents(id),
             FOREIGN KEY(gap_id) REFERENCES detected_gaps(id)
         );
+
+        -- Document full text storage for deferred scoring
+        CREATE TABLE IF NOT EXISTS document_texts (
+            doc_id TEXT PRIMARY KEY,
+            text TEXT NOT NULL,
+            FOREIGN KEY(doc_id) REFERENCES documents(id)
+        );
         """
         
         try:

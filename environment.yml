@@ -33,6 +33,9 @@ dependencies:
     # Language detection (alternative)
     - fasttext-wheel
     
+    # Async HTTP fetching
+    - aiohttp
+
     # Crawling (optional, for advanced fetching)
     - playwright
     - curl_cffi
