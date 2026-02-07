@@ -1,28 +1,87 @@
 # Curation Module
 
-Quality scoring and content curation algorithms.
+Quality scoring and content curation algorithms with modular, protocol-based architecture.
 
-## Components
+## Architecture
 
-### Scoring (`scoring.py`)
-Multi-dimensional quality scoring:
+The curation module has been refactored into a modular package with extensible components:
+
+```
+curation/
+└── scoring/              # Modular scoring package
+    ├── __init__.py       # Public API + backward compatibility
+    ├── pipeline.py       # ScoringPipeline orchestrator
+    ├── protocols.py      # Type protocols (ScoringMetric, ScoreAggregator)
+    ├── registry.py       # MetricRegistry for extensibility
+    ├── detection.py      # Content type detection
+    ├── aggregation.py    # Weighted sigmoid + Wilson score
+    ├── _compat.py        # Backward compatibility facade
+    └── metrics/          # Individual metric modules
+        ├── citation.py
+        ├── depth.py
+        ├── methodology.py
+        ├── reputation.py
+        ├── specificity.py
+        ├── structure.py
+        └── writing.py
+```
+
+## Usage
+
+### Backward Compatible API
 
 ```python
-from curation.scoring import QualityScorer
+# Old API still works via compatibility layer
+from curation.scoring import scorer
 
-scorer = QualityScorer()
 score = scorer.score(document)  # Returns 0.0-1.0
 ```
 
-## Scoring Dimensions
+### New Modular API
 
-| Dimension | Weight | Signals |
-|-----------|--------|---------|
-| Content Depth | 0.35 | Word count, paragraph structure, code blocks |
-| Authority | 0.25 | Domain reputation, author presence |
-| Freshness | 0.15 | Publication date, update frequency |
-| Originality | 0.15 | Dedup score, citation density |
-| Accessibility | 0.10 | Reading level, formatting quality |
+```python
+from curation.scoring import ScoringPipeline
+
+pipeline = ScoringPipeline()
+
+# Step 1: Compute raw metrics
+raw_metrics = pipeline.compute_raw_metrics(text, metadata)
+# Returns: {'citation_quality': 0.8, 'depth': 0.6, ...}
+
+# Step 2: Detect content type
+content_type = pipeline.detect_content_type(text, metadata)
+# Returns: 'scientific', 'technical_code', 'personal_essay', etc.
+
+# Step 3: Aggregate with content-type-specific weights
+quality_score = pipeline.compute_score(raw_metrics, content_type)
+
+# Step 4: Compute Wilson score (sample-size-aware confidence)
+wilson_score = pipeline.compute_document_wilson_score(raw_metrics)
+```
+
+## Built-in Metrics
+
+| Metric | File | Measures |
+|--------|------|----------|
+| Citation Quality | `citation.py` | DOIs, reference density, academic citations |
+| Content Depth | `depth.py` | Word count, paragraph structure, code blocks |
+| Methodology | `methodology.py` | Methodology transparency, reproducibility |
+| Reputation | `reputation.py` | Domain authority, author credibility |
+| Specificity | `specificity.py` | Jargon density, technical depth |
+| Structure | `structure.py` | Heading hierarchy, formatting quality |
+| Writing Quality | `writing.py` | Grammar, typos, readability |
+
+## Content-Type-Specific Scoring
+
+Different content types use different weight profiles:
+
+| Content Type | Key Metrics | Quality Threshold |
+|--------------|-------------|-------------------|
+| scientific | citation_quality (0.28), methodology (0.24) | 0.50 |
+| technical_code | code_quality (0.27), recency (0.23) | 0.45 |
+| personal_essay | writing_quality (0.32), specificity (0.26) | 0.40 |
+| news | source_attribution (0.31), multiple_perspectives (0.24) | 0.50 |
+| documentation | completeness (0.32), accuracy (0.26) | 0.45 |
 
 ## Quality Categories
 
@@ -34,15 +93,64 @@ LOW_QUALITY = score < 0.4     # Needs review
 
 ## Wilson Score
 
-For confidence-aware ranking with limited data:
+Sample-size-aware confidence scoring:
 
 ```python
-def wilson_score(successes, total, z=1.96):
-    """Lower bound of Wilson score interval (95% CI)"""
-    if total == 0:
-        return 0
-    p = successes / total
-    return (p + z*z/(2*n) - z*sqrt(p*(1-p)/n + z*z/(4*n*n))) / (1 + z*z/n)
+# Compute Wilson score from raw metrics
+wilson_score = pipeline.compute_document_wilson_score(raw_metrics)
+
+# Or compute from counts
+positive_signals = 50  # Number of positive quality signals
+total_signals = 55     # Total signals evaluated
+wilson = pipeline.compute_wilson_score(positive_signals, total_signals, z=1.96)
+
+# Returns conservative lower bound of confidence interval
+# Example: 50/55 = 90.9% raw score → 80.6% Wilson score (95% CI)
+```
+
+## Custom Metrics
+
+Extend the system with custom metrics following the `ScoringMetric` protocol:
+
+```python
+from curation.scoring.protocols import ScoringMetric
+from typing import List, Dict, Any
+
+class MyCustomMetric:
+    @property
+    def name(self) -> str:
+        return "custom_metric"
+
+    def compute(
+        self,
+        text: str,
+        words: List[str],
+        sentences: List[str],
+        metadata: Dict[str, Any],
+    ) -> float:
+        # Your metric logic here
+        return 0.5  # Return 0.0-1.0
+
+# Register and use
+pipeline = ScoringPipeline()
+pipeline.registry.register(MyCustomMetric())
+```
+
+## Content-Type-Specific Weight Calibration
+
+Update weights for specific content types:
+
+```python
+pipeline.update_weights("scientific", {
+    "citation_quality": 0.30,
+    "methodology": 0.25,
+    "depth": 0.20,
+    "specificity": 0.15,
+    "writing": 0.10,
+})
+
+# Weights are applied automatically based on detected content type
+score = pipeline.compute_score(raw_metrics, content_type="scientific")
 ```
 
 ## Configuration
@@ -56,12 +164,19 @@ def wilson_score(successes, total, z=1.96):
   "language": {
     "target": "en",
     "use_langdetect": true
+  },
+  "calibration": {
+    "current_version": 1,
+    "holdout_fraction": 0.2,
+    "default_content_type": "technical_code"
   }
 }
 ```
 
-## Future Enhancements
+## Golden Set Calibration
 
-- Golden set calibration (see `golden_metrics/`)
-- QADI metrics for alignment tracking
-- Topic-cluster cross-validation
+Weights are calibrated using a Golden Set of manually labeled documents:
+- 200 exemplary documents per content type
+- 200 garbage documents per content type
+- Topic-cluster cross-validation (prevents 28-40% overfit)
+- QADI metrics for validation (quantity vs allocation diagnosis)

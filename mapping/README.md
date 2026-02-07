@@ -1,6 +1,20 @@
 # Mapping Module
 
-Semantic mapping of documents to 2D/3D coordinates with topic clustering.
+Semantic mapping of documents to 2D/3D coordinates with topic clustering. Refactored with protocol-based, modular architecture.
+
+## Architecture
+
+```
+mapping/
+├── __init__.py           # Public API + backward compatibility
+├── pipeline.py           # MappingPipeline orchestrator
+├── protocols.py          # Type protocols (Projector, Clusterer, AxisScorer)
+├── registry.py           # ComponentRegistry for extensibility
+├── mapper.py             # AtlasMapper (backward compat facade)
+├── projectors.py         # UMAPProjector
+├── clusterers.py         # HDBSCANClusterer
+└── axis_scorers.py       # DomainAuthorityAxisScorer
+```
 
 ## Overview
 
@@ -21,21 +35,66 @@ Embeddings (384D) ─▶ UMAP ─▶ 2D Coordinates
               Importance Scoring ─▶ Z-axis
 ```
 
-## Key Classes
+## Usage
 
-### `SemanticMapper`
-Main entry point for computing mappings:
+### Backward Compatible API
+
 ```python
-mapper = SemanticMapper(store)
+# Old API still works
+from mapping.mapper import AtlasMapper
+
+mapper = AtlasMapper()
 result = mapper.compute_mapping(sample_size=50000)
 result.export_to_json("data/mappings/latest.json")
 ```
 
-### `MappingResult`
-Container for mapping data with export methods:
-- `to_dict()`: Convert to JSON-serializable dict
-- `export_to_json()`: Write to file with NumpyEncoder
-- Statistics: cluster distribution, quality metrics
+### New Modular API
+
+```python
+from mapping import MappingPipeline
+from common.qdrant_manager import QdrantManager
+
+pipeline = MappingPipeline()
+
+# Load embeddings from Qdrant
+qm = QdrantManager()
+embeddings = qm.get_all_vectors()
+
+# Step 1: Project to 2D
+coordinates = pipeline.project(embeddings, force_refit=False)
+
+# Step 2: Cluster
+cluster_labels = pipeline.cluster(coordinates)
+
+# Step 3: Score importance (Z-axis)
+for doc in documents:
+    importance = pipeline.score_importance(
+        domain=doc.domain,
+        quality_score=doc.quality_score,
+        content_type=doc.content_type,
+    )
+```
+
+### Custom Components
+
+Swap in custom implementations following the protocols:
+
+```python
+from mapping.protocols import Projector, Clusterer, AxisScorer
+from mapping import MappingPipeline
+
+class MyCustomProjector:
+    def fit_transform(self, embeddings: np.ndarray) -> np.ndarray:
+        # Your projection logic
+        return coordinates_2d
+
+    def transform(self, embeddings: np.ndarray) -> np.ndarray:
+        # Transform using fitted model
+        return coordinates_2d
+
+# Use custom component
+pipeline = MappingPipeline(projector=MyCustomProjector())
+```
 
 ## Configuration (`config.json`)
 

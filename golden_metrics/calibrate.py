@@ -1,33 +1,31 @@
 import argparse
 import json
-import sqlite3
 import math
 import random
 from typing import List, Dict, Tuple, Any
+from urllib.parse import urlparse
 from collections import defaultdict
 import numpy as np
 from common.database import db
 from common.config import config
 from common.models import GoldenSetEntry
 from common.repositories import GoldenSetRepository
-from curation.scoring import scorer
+from curation.scoring import ScoringPipeline
 from common.logging.logger import get_logger
 
 # specific logging for calibration
 logger = get_logger("calibration")
 
-class Calibrator:
-    def __init__(self):
-        self.conn = db.get_connection()
 
 def process_url_task(row_data, index, total_rows):
     """
     Independent function for processing a single URL task.
     Must be top-level for multiprocessing picklability.
     """
-    # Re-import logger here to ensure it works in subprocess
+    # Re-import in subprocess for picklability
     from common.logging.logger import get_logger
-    from curation.scoring import scorer
+    from curation.scoring import ScoringPipeline
+    from urllib.parse import urlparse
     import trafilatura
     import requests
 
@@ -89,8 +87,9 @@ def process_url_task(row_data, index, total_rows):
         meta_dict = {"url": url}
 
     try:
-        raw_metrics = scorer.compute_raw_metrics(text, meta_dict)
-        domain = scorer._get_domain(url)
+        pipeline = ScoringPipeline()
+        raw_metrics = pipeline.compute_raw_metrics(text, meta_dict)
+        domain = urlparse(url).netloc
     except Exception as e:
         print(f"Scoring failed for {url}: {e}")
         return None
@@ -107,12 +106,12 @@ def process_url_task(row_data, index, total_rows):
         "total": total_rows
     }
 
+
 class Calibrator:
-    def __init__(self, database=None, quality_scorer=None, golden_set_repo=None):
+    def __init__(self, database=None, scoring_pipeline=None, golden_set_repo=None):
         self._database = database or db
-        self._scorer = quality_scorer or scorer
+        self._pipeline = scoring_pipeline or ScoringPipeline()
         self._golden_set_repo = golden_set_repo or GoldenSetRepository(self._database)
-        self.conn = self._database.get_connection()
 
     def import_from_csv(self, csv_path: str):
         """
@@ -255,7 +254,7 @@ class Calibrator:
             logger.warning("Train set empty.")
             return
 
-        feature_names = self._scorer.METRICS
+        feature_names = self._pipeline.registry.names
         X_train = [[s["metrics"].get(f, 0.0) for f in feature_names] for s in train_set]
         y_train = [s["label"] for s in train_set]
 
@@ -280,7 +279,7 @@ class Calibrator:
              return
 
         logger.info(f"New calibrated weights for {content_type}: {new_weights}")
-        self._scorer.update_weights(content_type, new_weights)
+        self._pipeline.update_weights(content_type, new_weights)
         return new_weights
 
     def compute_qadi(self, confusion_matrix: np.ndarray) -> Dict[str, float]:
@@ -318,7 +317,7 @@ class Calibrator:
 
         for label_str, metrics in rows:
             label_val = int(label_str)
-            score = self._scorer.compute_score(metrics, content_type)
+            score = self._pipeline.compute_score(metrics, content_type)
 
             # Binary classification for QADI: Good (>=4) vs Bad (<=2). Ignore 3.
             if label_val >= 4:

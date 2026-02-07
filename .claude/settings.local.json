@@ -17,7 +17,16 @@
       "Bash(/opt/homebrew/Caskroom/miniforge/base/envs/infolake/bin/python:*)",
       "Bash(lsof:*)",
       "Bash(orbctl list:*)",
-      "Bash(orb list:*)"
+      "Bash(orb list:*)",
+      "Bash(git fetch:*)",
+      "Bash(git pull:*)",
+      "Bash(git push:*)",
+      "Bash(conda info:*)",
+      "Bash(pip3 show:*)",
+      "Bash(/opt/homebrew/bin/pip3 show:*)",
+      "Bash(pip3.12 show:*)",
+      "Bash(pip3.11 show:*)",
+      "Bash(source:*)"
     ]
   }
 }

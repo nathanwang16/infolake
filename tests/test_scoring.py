@@ -1,13 +1,13 @@
-"""Tests for curation/scoring.py — quality scoring and Wilson score."""
+"""Tests for curation/scoring — quality scoring and Wilson score."""
 
 import pytest
 
-from curation.scoring import QualityScorer
+from curation.scoring import ScoringPipeline
 
 
 @pytest.fixture
 def scorer():
-    return QualityScorer()
+    return ScoringPipeline()
 
 
 # ── Wilson Score ──────────────────────────────────────────────
@@ -45,7 +45,7 @@ class TestRawMetrics:
     def test_returns_expected_keys(self, scorer):
         text = "This is a test document with enough words to pass the check."
         metrics = scorer.compute_raw_metrics(text, {"url": "https://example.com"})
-        for key in scorer.METRICS:
+        for key in scorer.registry.names:
             assert key in metrics
 
     def test_no_link_density_penalty_key(self, scorer):
@@ -82,17 +82,17 @@ class TestRawMetrics:
 
 class TestComputeScore:
     def test_zero_metrics(self, scorer):
-        metrics = {m: 0.0 for m in scorer.METRICS}
+        metrics = {m: 0.0 for m in scorer.registry.names}
         score = scorer.compute_score(metrics)
         assert score < 0.1  # Sigmoid of 0 → near 0
 
     def test_perfect_metrics(self, scorer):
-        metrics = {m: 1.0 for m in scorer.METRICS}
+        metrics = {m: 1.0 for m in scorer.registry.names}
         score = scorer.compute_score(metrics)
         assert score > 0.9  # Sigmoid of 1 → near 1
 
     def test_unknown_content_type_uses_default(self, scorer):
-        metrics = {m: 0.5 for m in scorer.METRICS}
+        metrics = {m: 0.5 for m in scorer.registry.names}
         score_default = scorer.compute_score(metrics, "default")
         score_unknown = scorer.compute_score(metrics, "nonexistent_type")
         assert score_default == score_unknown
@@ -103,8 +103,8 @@ class TestComputeScore:
 class TestUpdateWeights:
     def test_update_creates_new_type(self, scorer):
         scorer.update_weights("custom_type", {"citation_quality": 1.0})
-        assert "custom_type" in scorer.weights
+        assert "custom_type" in scorer._weight_overrides
 
     def test_update_overwrites_existing(self, scorer):
         scorer.update_weights("default", {"citation_quality": 0.5})
-        assert scorer.weights["default"]["citation_quality"] == 0.5
+        assert scorer._weight_overrides["default"]["citation_quality"] == 0.5

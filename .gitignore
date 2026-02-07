@@ -84,3 +84,7 @@ htmlcov/
 *.tmp
 *.temp
 *.bak
+
+.claude/*
+
+

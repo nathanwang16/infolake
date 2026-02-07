@@ -339,6 +339,89 @@ class DocumentRepository:
         finally:
             conn.close()
 
+    def update_score(
+        self,
+        doc_id: str,
+        quality_score: float,
+        quality_components: str,
+        content_type: str,
+        wilson_score: float,
+        status: str = 'active',
+    ) -> None:
+        """Update quality scores for a single document.
+
+        Args:
+            doc_id: Document ID
+            quality_score: Computed quality score (0.0-1.0)
+            quality_components: JSON string of raw metrics
+            content_type: Detected content type
+            wilson_score: Wilson confidence score
+            status: Document status ('active', 'duplicate', etc.)
+        """
+        conn = self._db.get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE documents
+                SET quality_score = ?,
+                    quality_components = ?,
+                    quality_profile_used = ?,
+                    detected_content_type = ?,
+                    wilson_score = ?,
+                    status = ?
+                WHERE id = ?
+            """, (
+                quality_score,
+                quality_components,
+                content_type,
+                content_type,
+                wilson_score,
+                status,
+                doc_id,
+            ))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def update_scores_batch(self, updates: List[Tuple]) -> None:
+        """Batch update quality scores for multiple documents.
+
+        Args:
+            updates: List of (doc_id, quality_score, quality_components_json,
+                     content_type, wilson_score, status) tuples
+        """
+        conn = self._db.get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.executemany("""
+                UPDATE documents
+                SET quality_score = ?,
+                    quality_components = ?,
+                    quality_profile_used = ?,
+                    detected_content_type = ?,
+                    wilson_score = ?,
+                    status = ?
+                WHERE id = ?
+            """, [(
+                quality_score,
+                quality_components_json,
+                content_type,
+                content_type,
+                wilson_score,
+                status,
+                doc_id,
+            ) for doc_id, quality_score, quality_components_json,
+                  content_type, wilson_score, status in updates])
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
 
 class MetricsRepository:
     """Replaces raw SQL in monitor/health.py."""

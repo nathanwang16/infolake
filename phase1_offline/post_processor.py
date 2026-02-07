@@ -25,7 +25,7 @@ from common.config import config
 from common.database import db as _default_db
 from common.repositories import DocumentRepository, DocumentTextRepository
 from common.qdrant_manager import QdrantManager
-from curation.scoring import scorer as _default_scorer
+from curation.scoring import ScoringPipeline
 from curation.scoring.detection import RuleBasedContentTypeDetector
 from phase1_offline.deduplication import Deduplicator, compute_content_hash
 from phase1_offline.fps_sampler import FarthestPointSampler
@@ -40,14 +40,14 @@ class PostProcessor:
         self,
         database=None,
         qdrant_manager=None,
-        quality_scorer=None,
+        scoring_pipeline=None,
         doc_repo=None,
         text_repo=None,
         content_type_detector=None,
     ):
         self._database = database or _default_db
         self._qdrant_mgr = qdrant_manager or QdrantManager(create_if_missing=False, timeout=5)
-        self._scorer = quality_scorer or _default_scorer
+        self._pipeline = scoring_pipeline or ScoringPipeline()
         self._doc_repo = doc_repo or DocumentRepository(self._database)
         self._text_repo = text_repo or DocumentTextRepository(self._database)
         self._detector = content_type_detector or RuleBasedContentTypeDetector()
@@ -166,8 +166,8 @@ class PostProcessor:
         content_type = self._detector.detect(text, metadata)
 
         # 2. Compute quality score
-        raw_metrics = self._scorer.compute_raw_metrics(text, metadata)
-        quality_score = self._scorer.compute_score(raw_metrics, content_type)
+        raw_metrics = self._pipeline.compute_raw_metrics(text, metadata)
+        quality_score = self._pipeline.compute_score(raw_metrics, content_type)
 
         # 3. SimHash dedup check
         if not skip_dedup:
@@ -208,39 +208,20 @@ class PostProcessor:
         status: str = 'active',
     ):
         """Update document with computed quality scores."""
-        conn = self._database.get_connection()
+        positive = int(quality_score * 100)
+        wilson = self._pipeline.compute_wilson_score(positive, 100)
+
         try:
-            cursor = conn.cursor()
-
-            # Compute Wilson score approximation
-            # Use quality_score as proxy: positive = score * 100, total = 100
-            positive = int(quality_score * 100)
-            wilson = self._scorer.compute_wilson_score(positive, 100)
-
-            cursor.execute("""
-                UPDATE documents
-                SET quality_score = ?,
-                    quality_components = ?,
-                    quality_profile_used = ?,
-                    detected_content_type = ?,
-                    wilson_score = ?,
-                    status = ?
-                WHERE id = ?
-            """, (
-                quality_score,
-                json.dumps(raw_metrics),
-                content_type,
-                content_type,
-                wilson,
-                status,
-                doc_id,
-            ))
-            conn.commit()
+            self._doc_repo.update_score(
+                doc_id=doc_id,
+                quality_score=quality_score,
+                quality_components=json.dumps(raw_metrics),
+                content_type=content_type,
+                wilson_score=wilson,
+                status=status,
+            )
         except Exception as e:
-            conn.rollback()
             logger.error(f"Failed to update document {doc_id}: {e}")
-        finally:
-            conn.close()
 
     def get_stats(self) -> Dict[str, Any]:
         """Returns post-processing statistics."""

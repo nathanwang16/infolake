@@ -7,7 +7,6 @@ Computes visualization coordinates and diversity metrics:
 - Topic clustering (HDBSCAN)
 """
 
-from mapping.mapper import AtlasMapper, MappingResult, ImportanceScorer
 from mapping.protocols import Projector, Clusterer, AxisScorer
 from mapping.pipeline import MappingPipeline
 from mapping.registry import ComponentRegistry
@@ -16,10 +15,6 @@ from mapping.clusterers import HDBSCANClusterer
 from mapping.axis_scorers import DomainAuthorityAxisScorer
 
 __all__ = [
-    # Backward compat
-    'AtlasMapper',
-    'MappingResult',
-    'ImportanceScorer',
     # Protocols
     'Projector',
     'Clusterer',

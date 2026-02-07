@@ -483,94 +483,219 @@ FARTHEST_POINT_SAMPLING_HNSW(candidates, k, batch_size=1000):
                 ≈ O(n log n) for typical parameters
 ```
 
-### 3.5 Producer-Consumer Pipeline Architecture
+### 3.5 Two-Stage Pipeline Architecture
 
-Single-machine processing uses a simple producer-consumer pattern, not distributed agents. The bottleneck is I/O, not CPU coordination.
+**Breaking change from v1.0:** The pipeline has been refactored into two stages for improved throughput and flexibility.
+
+**Stage 1 (Batch Ingestion):** High-throughput storage-only pipeline
+**Stage 2 (Post-Processing):** Deferred scoring, filtering, and selection
 
 ```
-PRODUCER_CONSUMER_PIPELINE:
+STAGE 1: BATCH INGESTION (async + multiprocess)
 
     ARCHITECTURE:
         ┌──────────────┐     ┌─────────────────┐     ┌──────────────┐
-        │   PRODUCER   │────►│  WORK QUEUES    │────►│    WRITER    │
-        │  (1 process) │     │                 │     │  (1 process) │
-        └──────────────┘     │  url_queue      │     └──────────────┘
-                             │  html_queue     │            │
-        ┌──────────────┐     │  embed_queue    │            ▼
-        │   WORKERS    │◄────│                 │     ┌──────────────┐
-        │  (N threads) │────►│                 │     │ Qdrant/SQLite│
-        └──────────────┘     └─────────────────┘     └──────────────┘
-    
+        │   PRODUCER   │────►│  url_queue      │────►│ AsyncFetcher │
+        │  (1 process) │     │                 │     │ (event loop) │
+        └──────────────┘     └─────────────────┘     └──────┬───────┘
+                                                             │
+                             ┌─────────────────┐            ▼
+                             │  html_queue     │◄───────────┘
+                             └────────┬────────┘
+                                      │
+                             ┌────────▼────────┐     ┌──────────────┐
+                             │  ExtractPool    │────►│  text_queue  │
+                             │ (ProcessPool)   │     │              │
+                             └─────────────────┘     └──────┬───────┘
+                                                             │
+                             ┌─────────────────┐            ▼
+                             │ ConcurrentEmbed │◄───────────┘
+                             │ (GPU batching)  │
+                             └────────┬────────┘
+                                      │
+                             ┌────────▼────────┐     ┌──────────────┐
+                             │  embed_queue    │────►│    WRITER    │
+                             │                 │     │ (store-only) │
+                             └─────────────────┘     └──────┬───────┘
+                                                             │
+                                                             ▼
+                                                  ┌──────────────────┐
+                                                  │ SQLite + Qdrant  │
+                                                  │ + document_texts │
+                                                  └──────────────────┘
+
+STAGE 2: POST-PROCESSING (deferred scoring)
+
+    ┌──────────────────┐     ┌──────────────┐     ┌──────────────┐
+    │ document_texts   │────►│PostProcessor │────►│   Update DB  │
+    │ (unscored batch) │     │ Score+Dedup  │     │ quality_score│
+    └──────────────────┘     │  +FPS (opt)  │     │ wilson_score │
+                             └──────────────┘     └──────────────┘
+
+STAGE 1 COMPONENTS:
+
     PRODUCER (single process):
         1. Read dump file sequentially
-        2. Apply URL pattern filters
+        2. Apply URL pattern filters (moved from worker)
         3. Check Bloom filter for already-processed URLs
         4. Push valid URLs to url_queue
-        5. No decisions beyond filtering—just feeds the pipeline
-    
-    WORKERS (N threads, typically 8-16):
+        5. No decisions beyond filtering
+
+    ASYNC FETCHER (event loop, aiohttp):
         1. Pull URL from url_queue
-        2. Fetch content (I/O bound—benefits from high concurrency)
-        3. Extract text with trafilatura (compute raw_html_hash for provenance)
-        4. Compute embedding with bge-small
-        5. Push (url, embedding, extracted_content, metadata) to embed_queue
-        6. Stateless: no coordination needed between workers
-    
-    WRITER (single process):
-        1. Only process that writes to Qdrant and SQLite
+        2. Async HTTP fetch (concurrency: 100)
+        3. Optional playwright for JavaScript-heavy sites (concurrency: 4)
+        4. 15s timeout, exponential backoff
+        5. Push (url, html) to html_queue
+
+    EXTRACT POOL (ProcessPoolExecutor, 8 workers):
+        1. Pull (url, html) from html_queue
+        2. Extract text with trafilatura (CPU-bound)
+        3. Compute raw_html_hash for provenance
+        4. Language + length filters
+        5. Push (url, text, metadata, hash) to text_queue
+        6. Module-level _extract_worker_fn for pickling
+
+    CONCURRENT EMBEDDER (GPU batching, batch_size=256):
+        1. Pull batch of texts from text_queue
+        2. Compute embeddings with bge-small on MPS/CUDA
+        3. OOM protection: auto-reduce batch_size on errors
+        4. Push (url, embedding, text, metadata, hash) to embed_queue
+
+    WRITER (single process, store-only):
+        1. Only process that writes to databases
         2. Pull from embed_queue
-        3. Check novelty against existing index
-        4. Run lazy greedy FPS selection
-        5. Score documents using calibrated weights
-        6. Write accepted documents to atlas
-        7. Archive parsed content for accepted documents
-        8. No locks needed: single-threaded entry point
+        3. Generate document ID: SHA256(canonical_url)[:16]
+        4. Write to documents (quality_profile_used='pending')
+        5. Write to document_texts (for deferred scoring)
+        6. Write vector to Qdrant
+        7. Archive parsed content to compressed JSONL
+        8. No scoring, no FPS, no dedup at this stage
+        9. No locks needed: single-threaded entry point
+
+STAGE 2 COMPONENTS:
+
+    POSTPROCESSOR (batch processing):
+        1. Query unscored documents (quality_profile_used='pending')
+        2. Load full text from document_texts table
+        3. Detect content type (scientific, code, essay, etc.)
+        4. Compute quality scores with calibrated weights
+        5. Compute Wilson scores (sample-size-aware confidence)
+        6. Run SimHash deduplication
+        7. Optional: Run FPS selection
+        8. Update documents table with scores and status
+        9. Process in batches (default: 1000 docs/batch)
     
-    BENEFITS:
+TWO-STAGE BENEFITS:
+
+    Stage 1 (Ingestion):
+        - **10x writer throughput:** No scoring bottleneck (~1200 docs/sec vs ~500)
+        - **Async I/O:** aiohttp saturates network, playwright handles JS sites
+        - **Multiprocess extraction:** Saturates all CPU cores
+        - **Fault tolerance:** Text preserved even if scoring crashes
+        - **No locks:** Single-writer architecture, no coordination overhead
+
+    Stage 2 (Post-Processing):
+        - **Re-scorable:** Update weights without re-crawling
+        - **A/B testable:** Compare scoring algorithms on same corpus
+        - **Debuggable:** Clear separation, easier to isolate scoring bugs
+        - **Flexible:** Run FPS optionally, adjust quality thresholds
+
+    Overall:
         - No mutexes, no race conditions, no distributed coordination
-        - Natural backpressure via queue sizes (workers block when queues full)
-        - Easy to tune: adjust worker count based on I/O saturation
+        - Natural backpressure via queue sizes
         - Crash recovery: resume from queue state
-        - Simpler code: ~500 fewer lines vs. multi-agent approach
+        - Simpler debugging: stages isolated
 
-    QUEUE SIZING:
-        url_queue: 10,000 items max (memory ~1MB)
-        embed_queue: 5,000 items max (memory ~50MB with embeddings + extracted content)
+QUEUE SIZING:
+    url_queue: 10,000 items (memory ~1MB)
+    html_queue: 5,000 items (memory ~500MB raw HTML)
+    text_queue: 5,000 items (memory ~50MB extracted text)
+    embed_queue: 5,000 items (memory ~50MB vectors + metadata)
+
+CONFIGURATION (config.json):
+    "batch_processing": {
+        "fetch_concurrency": 100,         // Async HTTP concurrency
+        "fetch_timeout": 15,              // Seconds
+        "use_playwright": false,          // Enable for JS sites
+        "playwright_concurrency": 4,      // Browser pool size
+        "extract_processes": 8,           // CPU cores for extraction
+        "skip_scoring": true,             // Must be true for new pipeline
+        "skip_url_filter": true,          // Filter in producer instead
+        "url_queue_size": 10000,
+        "embed_queue_size": 5000
+    }
 ```
 
-**Implementation sketch:**
+**Implementation (Stage 1 - Ingestion):**
 
 ```
-RUN_PIPELINE(dump_path, num_workers=12):
+RUN_BATCH_INGESTION(dump_path):
+    # Initialize queues
     url_queue ← bounded_queue(max=10000)
+    html_queue ← bounded_queue(max=5000)
+    text_queue ← bounded_queue(max=5000)
     embed_queue ← bounded_queue(max=5000)
-    
+
+    # Start producer
     PRODUCER:
         FOR url IN read_dump(dump_path):
             IF passes_filters(url) AND NOT in_bloom_filter(url):
                 url_queue.put(url)
-    
-    WORKER (× num_workers, parallel):
+
+    # Start async fetcher (event loop)
+    ASYNC FETCHER:
         WHILE NOT shutdown:
             url ← url_queue.get()
-            html ← fetch_url(url)
+            html ← await aiohttp.get(url, timeout=15)
             IF html IS NULL: CONTINUE
-            
-            raw_html_hash ← sha256(html)
-            text, metadata ← extract_content(html)
-            IF len(text) < 100: CONTINUE
-            
-            embedding ← compute_embedding(text)
-            embed_queue.put(url, embedding, text, metadata, raw_html_hash)
-    
-    WRITER (single-threaded):
+            html_queue.put((url, html))
+
+    # Start extract pool (ProcessPoolExecutor)
+    EXTRACT POOL (8 processes):
         WHILE NOT shutdown:
+            (url, html) ← html_queue.get()
+            raw_html_hash ← sha256(html)
+            text, metadata ← trafilatura.extract(html)
+            IF len(text) < 100: CONTINUE
+            text_queue.put((url, text, metadata, raw_html_hash))
+
+    # Start embedder (GPU batching)
+    CONCURRENT EMBEDDER:
+        batch ← []
+        WHILE NOT shutdown OR text_queue.not_empty:
+            WHILE len(batch) < 256 AND text_queue.not_empty:
+                batch.append(text_queue.get())
+            embeddings ← model.encode([item.text for item in batch])
+            FOR item, embedding IN zip(batch, embeddings):
+                embed_queue.put((item.url, embedding, item.text,
+                                item.metadata, item.hash))
+            batch ← []
+
+    # Start writer (single-threaded)
+    WRITER:
+        WHILE NOT shutdown OR embed_queue.not_empty:
             (url, embedding, text, metadata, hash) ← embed_queue.get()
-            IF is_novel(embedding) AND passes_fps_selection(embedding):
-                score ← compute_quality_score(text)
-                IF score > threshold:
-                    add_to_atlas(url, embedding, score, hash)
-                    archive_parsed_content(url, text, metadata, hash)
+            doc_id ← sha256(url)[:16]
+
+            # Store document (quality_profile_used='pending')
+            documents.insert(doc_id, url, metadata, quality_score=0.0)
+            document_texts.insert(doc_id, text)
+            qdrant.upsert(doc_id, embedding)
+            archive.write(url, text, metadata, hash)
+```
+
+**CLI Usage:**
+
+```bash
+# Stage 1: Batch ingestion
+python -m phase1_offline.pipeline --dump dataset/sample.tar
+# Output: Documents with quality_profile_used='pending'
+
+# Stage 2: Post-processing
+python scripts/post_process.py
+python scripts/post_process.py --batch-size 500 --quality-threshold 0.2
+# Output: Documents scored, deduplicated, optionally FPS-selected
 ```
 
 ### 3.6 Speed Optimizations for Batch Processing
@@ -595,16 +720,24 @@ If better semantic understanding is needed later, add a **reranker** (e.g., `bge
 
 **Timing estimates for 1M documents:**
 
-| Stage | Time |
-| ----- | ---- |
-| Pre-filter (URL patterns) | ~2 seconds |
-| Fetch content (100 concurrent) | ~3 hours |
-| Content extraction (trafilatura) | ~6 hours |
-| Language + length filter | ~10 minutes |
-| Embedding computation | ~17 minutes |
-| Lazy greedy farthest-point sampling | ~3 minutes |
-| Archive parsed content | ~1 minute |
-| **Total** | **~10 hours** |
+| Stage | Step | Time | Bottleneck |
+| ----- | ---- | ---- | ---------- |
+| **Stage 1** | Pre-filter (URL patterns) | ~2 sec | CPU |
+| | Fetch content (100 concurrent async) | ~3 hours | Network |
+| | Content extraction (8 processes) | ~6 hours | CPU |
+| | Language + length filter | ~10 min | CPU |
+| | Embedding computation (GPU batched) | ~17 min | GPU/MPS |
+| | Write to DB/Qdrant/Archive | ~10 min | I/O |
+| | **Stage 1 Subtotal** | **~9.5 hours** | Network |
+| **Stage 2** | Content type detection | ~15 min | CPU (regex) |
+| | Quality scoring | ~45 min | CPU (metrics) |
+| | SimHash deduplication | ~30 min | CPU (hashing) |
+| | Wilson score computation | ~10 min | CPU |
+| | Database updates | ~15 min | I/O (SQLite) |
+| | FPS selection (optional) | ~20 min | CPU + Qdrant |
+| | **Stage 2 Subtotal** | **~2h 15min** | CPU |
+| **Total** | **Both Stages** | **~11.75 hours** | |
+| **Output** | Accepted documents | **~521K** | ~70% pass quality threshold |
 
 **Parallelization strategy (producer-consumer):**
 
@@ -2073,6 +2206,7 @@ Note: Extract-first storage uses ~5x less space than HTML archival.
 | 0.7.0 | Jan 2025 | Replaced code snippets with concise pseudocode, condensed YAML configs to tables |
 | 0.8.0 | Jan 2025 | **Cartographic techniques integration:** Topic-cluster cross-validation (prevents 28-40% overfit), QADI metrics (quantity vs allocation diagnosis), Wilson score ranking (sample-size-aware confidence), HDBSCAN clustering (quality topology, content farm detection, orphaned gem discovery), Coverage Gini coefficient (equity tracking), Monitor module, updated data models and CLI commands |
 | 1.0.0 | Jan 2026 | **MVP Implementation:** Complete batch pipeline (producer-consumer), UMAP+HDBSCAN mapping, interactive web visualizer, structured logging, modular scripts. See Appendix D for details. |
+| 1.1.0 | Feb 2026 | **Architecture Refactoring:** Two-stage pipeline (ingestion + post-processing), Repository pattern for data access, Protocol-based scoring package (modular metrics), Protocol-based mapping package (swappable components), AsyncFetcher (aiohttp + playwright), ExtractPool (multiprocess extraction), ConcurrentEmbedder (GPU batching with OOM protection), document_texts table (deferred scoring), QdrantManager abstraction, Domain models with type safety, 10x writer throughput improvement |
 
 ------
 
@@ -2084,17 +2218,27 @@ This appendix documents the actual implementation delivered in the initial MVP r
 
 | Component | Location | Status | Notes |
 |-----------|----------|--------|-------|
-| Batch Processing Pipeline | `phase1_offline/` | Complete | Producer-consumer with concurrent embedding |
+| **Batch Ingestion (Stage 1)** | `phase1_offline/pipeline.py` | Complete | Two-stage architecture, async + multiprocess |
+| AsyncFetcher | `phase1_offline/worker.py` | Complete | aiohttp + playwright for JS sites |
+| ExtractPool | `phase1_offline/worker.py` | Complete | Multiprocess CPU-bound extraction |
+| ConcurrentEmbedder | `phase1_offline/worker.py` | Complete | GPU batching with OOM protection |
+| Writer (Store-Only) | `phase1_offline/writer.py` | Complete | No scoring, writes to document_texts |
+| **Post-Processing (Stage 2)** | `phase1_offline/post_processor.py` | Complete | Deferred scoring + dedup + FPS |
 | SLOP Dump Adapter | `phase1_offline/dump_adapters.py` | Complete | Marginalia archive format |
 | Content Extraction | `phase1_offline/worker.py` | Complete | trafilatura + readability fallback |
-| Quality Scoring | `curation/scoring.py` | Complete | Multi-dimensional, configurable weights |
+| **Quality Scoring Package** | `curation/scoring/` | Complete | Modular, protocol-based, extensible |
+| ScoringPipeline | `curation/scoring/pipeline.py` | Complete | Orchestrates metrics + aggregation |
+| Individual Metrics | `curation/scoring/metrics/` | Complete | Citation, depth, methodology, etc. |
 | Deduplication | `phase1_offline/deduplication.py` | Complete | SimHash + MinHash |
-| SQLite Storage | `common/database.py` | Complete | Thread-safe, batch inserts |
-| Qdrant Storage | `storage/atlas_store.py` | Complete | Optional (graceful fallback) |
-| UMAP Mapping | `mapping/mapper.py` | Complete | 2D projection + HDBSCAN clustering |
+| **Repository Layer** | `common/repositories.py` | Complete | DocumentRepository, MetricsRepository, etc. |
+| SQLite Storage | `common/database.py` | Complete | Context manager, thread-safe |
+| QdrantManager | `common/qdrant_manager.py` | Complete | Unified Qdrant interface |
+| Domain Models | `common/models.py` | Complete | Type-safe dataclasses |
+| **UMAP Mapping Package** | `mapping/` | Complete | Protocol-based, swappable components |
+| MappingPipeline | `mapping/pipeline.py` | Complete | Orchestrates projection + clustering |
 | Web Visualizer | `visualizer/server.py` | Complete | Interactive canvas with pan/zoom |
 | Health Monitor | `monitor/health.py` | Complete | Gini, quality distribution, alerts |
-| Structured Logging | `src/logging/logger.py` | Complete | JSON logs to `logs/` |
+| Structured Logging | `common/logging/logger.py` | Complete | JSON logs to `logs/` |
 
 ### Not Yet Implemented (Phase 2)
 
@@ -2106,31 +2250,80 @@ This appendix documents the actual implementation delivered in the initial MVP r
 | Hyperbolic Projection | §6.3.5 | Hierarchical visualization |
 | Wayback Fallback | §3.1.4 | Dead link recovery |
 
-### Architecture Deviations
+### Architecture Deviations (v1.1)
 
 | Guide Specification | Actual Implementation | Rationale |
 |--------------------|----------------------|-----------|
+| Single-stage pipeline | Two-stage (ingest + post-process) | 10x writer throughput, re-scorable corpus |
+| Scoring in writer | Deferred to PostProcessor | Separation of concerns, flexibility |
+| Thread-based workers | Async fetcher + multiprocess extraction | Better I/O saturation + CPU utilization |
 | CLI commands (`./batch-sample`) | Python scripts (`scripts/batch_process.py`) | Simpler development workflow |
 | YAML configs | JSON config (`config.json`) | Native Python support |
 | Raw HTML archival | Extract-first (text only) | 5x storage reduction per guide v0.6 |
-| Multi-stage queues | Single embed queue | Simplified for MVP |
+| Direct SQL queries | Repository pattern | Type safety, testability, maintainability |
+| Monolithic scoring | Modular scoring package | Extensibility, protocol-based design |
 
-### Key Implementation Details
+### Key Implementation Details (v1.1)
 
-#### Concurrent Embedding
+#### Two-Stage Architecture
 ```python
-# ConcurrentEmbedder in worker.py
-- Separate thread with batch accumulation
-- Graceful drain on shutdown (_draining flag)
-- MPS/CUDA acceleration when available
+# Stage 1: Batch ingestion (scripts/batch_process.py)
+- AsyncFetcher: aiohttp event loop, 100 concurrent connections
+- ExtractPool: ProcessPoolExecutor with 8 workers
+- ConcurrentEmbedder: GPU batching with OOM protection
+- Writer: Store-only path, quality_profile_used='pending'
+
+# Stage 2: Post-processing (scripts/post_process.py)
+- PostProcessor: Batch scoring from document_texts table
+- Deferred: Content type detection, quality scoring, Wilson score
+- Optional: FPS selection, deduplication
+- Updates: quality_score, detected_content_type, status
+```
+
+#### Async HTTP Fetching
+```python
+# AsyncFetcher in worker.py
+- aiohttp.ClientSession for HTTP (100 concurrent)
+- playwright.async_api for JS-heavy sites (4 concurrent)
+- Exponential backoff on failures
+- Graceful shutdown with queue draining
+```
+
+#### Multiprocess Extraction
+```python
+# ExtractPool in worker.py
+- ProcessPoolExecutor saturates CPU cores
+- Module-level _extract_worker_fn for pickling compatibility
+- Trafilatura + readability fallback
+- Per-process stats tracking
+```
+
+#### Repository Pattern
+```python
+# common/repositories.py
+- DocumentRepository: Type-safe document operations
+- DocumentTextRepository: Deferred scoring text storage
+- MetricsRepository: Coverage metrics and monitoring
+- Each method opens/closes own connection (thread-safe)
+- Optional conn parameter for transactions
+```
+
+#### Protocol-Based Scoring
+```python
+# curation/scoring/
+- ScoringMetric protocol: Extensible metric system
+- ScoreAggregator protocol: Pluggable aggregation
+- MetricRegistry: Runtime metric discovery
+- Content-type-specific weight profiles
+- Backward compatible via _compat.py facade
 ```
 
 #### Thread-Safe Database Access
 ```python
 # database.py
 - Absolute path resolution (avoids CWD issues)
-- Thread-local connections via threading.local()
-- Non-daemon writer thread for clean shutdown
+- Context manager for transactions with auto-commit/rollback
+- Repository pattern prevents connection leaks
 ```
 
 #### Interactive Visualizer

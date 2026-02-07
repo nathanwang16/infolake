@@ -42,21 +42,119 @@ workers = config.get("batch_processing.workers", 4)
 - Single load from `config.json`
 
 ### Database (`database.py`)
-SQLite connection manager:
+SQLite connection manager with schema initialization:
 
 ```python
-from common.database import Database
+from common.database import Database, db
 
+# Use module-level singleton
 db = Database()
-docs = db.get_documents(limit=100)
-db.insert_documents(documents)
+conn = db.get_connection()
+
+# Or use context manager for automatic commit/rollback
+with db.connection() as conn:
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM documents LIMIT 10")
 ```
 
 **Features:**
-- Thread-local connections
+- Thread-safe connections (each thread gets its own)
 - Absolute path resolution (avoids CWD issues)
-- Schema auto-creation
-- Batch insert support
+- Schema auto-creation with `CREATE TABLE IF NOT EXISTS`
+- Context manager for transaction handling
+
+### Repositories (`repositories.py`)
+Data access layer following the Repository pattern:
+
+```python
+from common.repositories import (
+    DocumentRepository,
+    DocumentTextRepository,
+    MetricsRepository,
+    GoldenSetRepository,
+    JobRepository,
+)
+
+# Document operations
+doc_repo = DocumentRepository()
+doc = doc_repo.get_by_id("abc123")
+docs = doc_repo.get_list(limit=100, min_quality=0.5)
+count = doc_repo.get_count(content_type="scientific")
+
+# Text storage for deferred scoring
+text_repo = DocumentTextRepository()
+text_repo.insert(doc_id="abc123", text="Full document text...")
+text = text_repo.get_text("abc123")
+unscored_batch = text_repo.get_unscored_batch(batch_size=1000)
+
+# Metrics for monitoring
+metrics_repo = MetricsRepository()
+topic_dist = metrics_repo.get_topic_distribution()
+orphan_count = metrics_repo.get_high_quality_orphan_count()
+```
+
+**Benefits:**
+- Clean separation of data access logic
+- Type-safe with domain models
+- Thread-safe (each method opens its own connection)
+- Testable (can inject mock database)
+- Consistent error handling
+
+### Qdrant Manager (`qdrant_manager.py`)
+Unified interface for Qdrant vector database:
+
+```python
+from common.qdrant_manager import QdrantManager
+
+# Initialize (creates collection if missing)
+qm = QdrantManager(create_if_missing=True, timeout=5)
+
+# Access client
+client = qm.client
+collection_name = qm.collection_name
+is_available = qm.available
+
+# Insert vectors
+qm.upsert_points(points=[...])
+
+# Query vectors
+results = qm.search(query_vector=embedding, limit=10)
+```
+
+**Features:**
+- Automatic collection creation with quantization
+- Configuration from `config.json`
+- Backward-compatible properties
+- Health checking with timeout
+- Scalar quantization + on-disk storage support
+
+## Domain Models (`models.py`)
+Dataclasses for type-safe data handling:
+
+```python
+from common.models import (
+    Document,              # Full document with summary
+    DocumentListItem,      # Slim document for lists
+    DocumentCreate,        # Write-only model for inserts
+    ClusterInfo,          # Cluster statistics
+    CoverageMetrics,      # Atlas health metrics
+    SearchResult,         # Document + similarity score
+    GoldenSetEntry,       # Calibration entry
+)
+
+# Example: Load from database row
+row = cursor.fetchone()
+doc = Document.from_row(row)
+
+# Convert to dict for JSON serialization
+doc_dict = doc.to_dict()
+```
+
+**Benefits:**
+- Type hints for IDE autocomplete
+- Consistent field naming
+- Easy serialization to JSON
+- Backward-compatible with raw SQL
 
 ## Configuration Schema
 
@@ -64,28 +162,62 @@ See `config.json` for full schema. Key sections:
 
 | Section | Purpose |
 |---------|---------|
-| `database` | SQLite and Qdrant paths |
-| `batch_processing` | Worker count, queue sizes |
-| `embedding` | Model name, batch size |
+| `paths` | Data directories, archive paths |
+| `database` | SQLite path |
+| `qdrant` | Qdrant URL, collection, quantization |
+| `batch_processing` | Concurrency, queue sizes, thresholds |
+| `embedding` | Model name, device, batch size |
 | `mapping` | UMAP/HDBSCAN parameters |
 | `visualizer` | Host, port, static dir |
 | `monitor` | Alert thresholds |
+| `calibration` | Golden set configuration |
 
 ## Thread Safety
 
-### SQLite Threading
-```python
-# Uses thread-local storage for connections
-_thread_local = threading.local()
+### Repository Pattern
+Each repository method opens its own connection, ensuring thread safety:
 
-def get_connection(self):
-    if not hasattr(_thread_local, 'connection'):
-        _thread_local.connection = sqlite3.connect(self.db_path)
-    return _thread_local.connection
+```python
+def get_by_id(self, doc_id: str) -> Optional[Document]:
+    conn = self._db.get_connection()  # New connection per call
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT ... WHERE id = ?", (doc_id,))
+        row = cursor.fetchone()
+        return Document.from_row(row) if row else None
+    finally:
+        conn.close()  # Always close
+```
+
+### Transaction Handling
+Use the `conn` parameter for multi-operation transactions:
+
+```python
+with db.connection() as conn:
+    doc_repo.insert(doc, conn=conn)
+    text_repo.insert(doc.id, text, conn=conn)
+    # Both operations in same transaction
+    # Auto-commit on exit, auto-rollback on exception
 ```
 
 ### Absolute Paths
 ```python
 # Prevents issues when threads have different CWD
 self.db_path = os.path.abspath(raw_path)
+```
+
+## Migration from Direct SQL
+
+The repository pattern is backward compatible. Migrate gradually:
+
+```python
+# Old way (still works)
+conn = db.get_connection()
+cursor = conn.cursor()
+cursor.execute("SELECT * FROM documents WHERE id = ?", (doc_id,))
+row = cursor.fetchone()
+
+# New way (recommended)
+doc_repo = DocumentRepository()
+doc = doc_repo.get_by_id(doc_id)
 ```
