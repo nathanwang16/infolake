@@ -21,7 +21,13 @@ class Database:
         self._init_db()
 
     def get_connection(self):
-        return sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA busy_timeout = 5000")
+        except Exception as e:
+            logger.warning(f"Failed to apply SQLite pragmas: {e}")
+        return conn
 
     @contextmanager
     def connection(self):
@@ -38,6 +44,9 @@ class Database:
 
     def _init_db(self):
         """Initialize the database schema."""
+        db_exists = False
+        if self.db_path != ":memory:":
+            db_exists = Path(self.db_path).exists()
         schema = """
         -- Documents table
         CREATE TABLE IF NOT EXISTS documents (
@@ -197,8 +206,30 @@ class Database:
         
         try:
             with self.get_connection() as conn:
-                conn.executescript(schema)
-            logger.info(f"Database initialized at {self.db_path}")
+                try:
+                    conn.executescript(schema)
+                except sqlite3.OperationalError as e:
+                    if db_exists and "database is locked" in str(e).lower():
+                        logger.warning(
+                            "Database is locked during schema init; "
+                            "skipping initialization for this process"
+                        )
+                        return
+                    raise
+
+                if db_exists:
+                    try:
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT COUNT(*) FROM documents")
+                        existing_count = cursor.fetchone()[0]
+                        logger.info(
+                            f"Existing database detected at {self.db_path} "
+                            f"({existing_count} documents). No data deleted."
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to read existing document count: {e}")
+                else:
+                    logger.info(f"Database initialized at {self.db_path}")
         except Exception as e:
             logger.error(f"Failed to initialize database: {e}")
             raise

@@ -33,6 +33,7 @@ from common.logging.logger import get_logger, setup_logger
 from common.config import config
 from common.database import db
 from phase1_offline.producer import Producer, MultiProducer
+from phase1_offline.resource_governor import MemoryGovernor
 from phase1_offline.worker import (
     AsyncFetcher,
     ExtractPool,
@@ -182,7 +183,8 @@ class BatchPipeline:
         limit: int = 0,
         url_queue_size: Optional[int] = None,
         embed_queue_size: Optional[int] = None,
-        additional_dumps: Optional[List[str]] = None
+        additional_dumps: Optional[List[str]] = None,
+        resume: bool = False,
     ):
         if dump_path is None:
             raise ValueError("dump_path is required")
@@ -192,6 +194,7 @@ class BatchPipeline:
         self.all_dump_paths = [str(self.dump_path)] + self.additional_dumps
         self.num_workers = num_workers or config.get("batch_processing.workers")
         self.limit = limit
+        self.resume = resume
 
         # Queue configuration
         self.url_queue_size = url_queue_size or config.get("batch_processing.url_queue_size")
@@ -213,12 +216,22 @@ class BatchPipeline:
         self._shutdown_requested = False
         self._stats = PipelineStats(start_time=time.time())
         self._writer_thread = None
+        self._memory_governor: Optional[MemoryGovernor] = None
 
         logger.info(f"Pipeline initialized: dumps={self.all_dump_paths}, limit={limit}")
 
     def setup(self):
         """Initializes all pipeline components."""
         logger.info("Setting up pipeline components...")
+
+        # Resource governor (memory cap)
+        max_rss_gb = config.require("resource_limits.max_rss_gb")
+        check_interval = config.require("resource_limits.check_interval_seconds")
+        self._memory_governor = MemoryGovernor(
+            max_rss_gb=max_rss_gb,
+            check_interval_seconds=check_interval,
+        )
+        self._memory_governor.start()
 
         # Create queues
         self.url_queue = Queue(maxsize=self.url_queue_size)
@@ -232,13 +245,15 @@ class BatchPipeline:
             self.producer = MultiProducer(
                 url_queue=self.url_queue,
                 dump_paths=self.all_dump_paths,
-                total_limit=self.limit
+                total_limit=self.limit,
+                resume=self.resume,
             )
         else:
             self.producer = Producer(
                 url_queue=self.url_queue,
                 dump_path=str(self.dump_path),
-                limit=self.limit
+                limit=self.limit,
+                resume=self.resume,
             )
 
         # Create async fetcher
@@ -426,6 +441,10 @@ class BatchPipeline:
                 if self._writer_thread.is_alive():
                     logger.warning("Writer thread did not finish in time")
 
+        if self._memory_governor:
+            self._memory_governor.stop()
+            self._memory_governor.join(timeout=5.0)
+
         # Collect final statistics
         self._collect_stats()
 
@@ -468,7 +487,8 @@ class MultiDumpPipeline(BatchPipeline):
         dump_paths: List[str],
         num_workers: Optional[int] = None,
         limit_per_dump: int = 0,
-        total_limit: int = 0
+        total_limit: int = 0,
+        resume: bool = False,
     ):
         if dump_paths is None or not dump_paths:
             raise ValueError("dump_paths is required")
@@ -477,7 +497,8 @@ class MultiDumpPipeline(BatchPipeline):
         super().__init__(
             dump_path=dump_paths[0],
             num_workers=num_workers,
-            limit=total_limit
+            limit=total_limit,
+            resume=resume,
         )
 
         self.dump_paths = [Path(p) for p in dump_paths]
@@ -487,6 +508,15 @@ class MultiDumpPipeline(BatchPipeline):
     def setup(self):
         """Initializes components with multi-dump producer."""
         logger.info(f"Setting up multi-dump pipeline for {len(self.dump_paths)} dumps...")
+
+        # Resource governor (memory cap)
+        max_rss_gb = config.require("resource_limits.max_rss_gb")
+        check_interval = config.require("resource_limits.check_interval_seconds")
+        self._memory_governor = MemoryGovernor(
+            max_rss_gb=max_rss_gb,
+            check_interval_seconds=check_interval,
+        )
+        self._memory_governor.start()
 
         # Create queues
         self.url_queue = Queue(maxsize=self.url_queue_size)
@@ -499,7 +529,7 @@ class MultiDumpPipeline(BatchPipeline):
             url_queue=self.url_queue,
             dump_paths=[str(p) for p in self.dump_paths],
             limit_per_dump=self.limit_per_dump,
-            total_limit=self.total_limit
+            total_limit=self.total_limit,
         )
 
         # Create async fetcher
@@ -609,6 +639,11 @@ Examples:
         default=config.get("batch_processing.embed_queue_size"),
         help="Embedding queue capacity"
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume using existing database entries (no deletes)"
+    )
 
     # Output options
     parser.add_argument(
@@ -633,7 +668,8 @@ Examples:
             num_workers=args.workers,
             limit=args.limit,
             url_queue_size=args.url_queue_size,
-            embed_queue_size=args.embed_queue_size
+            embed_queue_size=args.embed_queue_size,
+            resume=args.resume,
         )
     else:
         # Multiple dumps
@@ -646,7 +682,8 @@ Examples:
             dump_paths=args.dumps,
             num_workers=args.workers,
             limit_per_dump=args.limit_per_dump,
-            total_limit=args.limit
+            total_limit=args.limit,
+            resume=args.resume,
         )
 
     # Run pipeline

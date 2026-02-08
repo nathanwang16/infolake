@@ -85,13 +85,16 @@ class ContentExtractor:
     """
     Extracts main content from HTML using trafilatura.
     Falls back to readability if trafilatura fails.
+
+    Extraction aims for maximum recall of human-readable text
+    while stripping ads, navigation, code blocks, and boilerplate.
     """
-    
+
     def __init__(self):
         self._trafilatura = None
         self._readability = None
         self._load_extractors()
-    
+
     def _load_extractors(self):
         """Lazy load extraction libraries."""
         try:
@@ -100,22 +103,21 @@ class ContentExtractor:
         except ImportError:
             logger.warning("trafilatura not installed")
             raise ImportError()
-        
+
         try:
             from readability import Document
             self._readability = Document
         except ImportError:
             logger.warning("readability-lxml not installed")
-            
-    
+
     def extract(self, html: str, url: str) -> Tuple[Optional[str], Dict[str, Any]]:
         """
         Extracts text and metadata from HTML.
-        
+
         Args:
             html: HTML content
             url: Source URL (for metadata extraction)
-            
+
         Returns:
             Tuple of (text, metadata dict)
         """
@@ -123,20 +125,22 @@ class ContentExtractor:
             raise ValueError("html is required")
         if url is None:
             raise ValueError("url is required")
-        
+
         text = None
         metadata = {'url': url}
-        
-        # Try trafilatura first
+
+        # Try trafilatura first (favor_recall for completeness)
         if self._trafilatura:
             try:
                 text = self._trafilatura.extract(
                     html,
                     include_comments=False,
-                    include_tables=False,
-                    url=url
+                    include_tables=True,
+                    favor_recall=True,
+                    deduplicate=True,
+                    url=url,
                 )
-                
+
                 # Extract metadata
                 meta = self._trafilatura.extract_metadata(html)
                 if meta:
@@ -150,27 +154,25 @@ class ContentExtractor:
                     })
             except Exception as e:
                 logger.debug(f"Trafilatura failed for {url}: {e}")
-        
+
         # Fallback to readability
         if not text and self._readability:
             try:
                 doc = self._readability(html)
                 text = doc.summary()
                 metadata['title'] = doc.title()
-                
+
                 # Strip HTML tags from readability output
                 text = re.sub(r'<[^>]+>', ' ', text)
                 text = re.sub(r'\s+', ' ', text).strip()
-                
+
             except Exception as e:
                 logger.debug(f"Readability failed for {url}: {e}")
-        
-        # Final cleanup
+
+        # Post-process for cleanliness
         if text:
-            # Remove excessive whitespace
-            text = re.sub(r'\n\s*\n', '\n\n', text)
-            text = text.strip()
-        
+            text = clean_extracted_text(text)
+
         return text, metadata
 
 
@@ -452,8 +454,9 @@ class BatchWorker(threading.Thread):
         try:
             import requests
         except ImportError:
-            logger.warning("requests not installed, using mock data")
-            return f"<html><body>Mock content for {url}</body></html>"
+            logger.error("requests not installed; cannot fetch URL content")
+            self.running = False
+            raise RuntimeError("requests dependency is required for synchronous fetching")
         
         for attempt in range(self.max_retries):
             try:
@@ -510,12 +513,9 @@ class BatchWorker(threading.Thread):
         model = get_embedding_model()
         
         if model is None:
-            # Mock embeddings for testing
-            for item in self._batch_buffer:
-                embedding = np.random.rand(384).tolist()
-                self._send_result(item, embedding)
-            self._batch_buffer = []
-            return
+            logger.error("Embedding model unavailable; cannot generate embeddings")
+            self.running = False
+            raise RuntimeError("Embedding model is required for batch processing")
         
         try:
             # Batch encode
@@ -626,12 +626,9 @@ class ConcurrentEmbedder(threading.Thread):
         model = get_embedding_model()
 
         if model is None:
-            # Mock embeddings
-            for item in batch:
-                item['embedding'] = np.random.rand(384).tolist()
-                self.output_queue.put(item)
-            self._stats['items'] += len(batch)
-            return
+            logger.error("Embedding model unavailable; cannot generate embeddings")
+            self.running = False
+            raise RuntimeError("Embedding model is required for concurrent embedding")
 
         self._encode_with_oom_retry(model, batch)
 
@@ -687,12 +684,96 @@ class ConcurrentEmbedder(threading.Thread):
         return self._stats.copy()
 
 
+def _clean_extracted_text(text: str) -> str:
+    """
+    Cleans extracted text by removing non-human-language artifacts.
+
+    Strips: code blocks, inline code, cookie/privacy banners, navigation
+    lists, excessive formatting, ad copy, and other boilerplate.
+
+    Must be a module-level function (used by ProcessPoolExecutor workers).
+    """
+    import re
+
+    # 1. Remove code blocks (fenced markdown, indented blocks of code-like content)
+    text = re.sub(r'```[\s\S]*?```', '', text)
+
+    # 2. Remove inline code/markup artifacts
+    text = re.sub(r'`[^`]+`', '', text)
+
+    # 3. Remove HTML/XML fragments that survived extraction
+    text = re.sub(r'<[^>]{1,200}>', '', text)
+    text = re.sub(r'&[a-z]+;', ' ', text)
+    text = re.sub(r'&#\d+;', ' ', text)
+
+    # 4. Remove CSS/JS artifacts (selectors, property blocks, function calls, media queries)
+    text = re.sub(r'[.#]?[a-zA-Z_][\w-]*\s*\{[^}]*\}', '', text)
+    text = re.sub(r'@media[^}]*\{[^}]*\}', '', text)
+    text = re.sub(r'@media[^\n]*', '', text)
+    text = re.sub(r'[a-zA-Z_]\w*\s*\([^)]{0,100}\)\s*\{', '', text)
+    text = re.sub(r'(?m)^[.#@][a-zA-Z_][\w-]*\s*$', '', text)
+
+    # 5. Remove common cookie/privacy/consent banner text
+    cookie_patterns = [
+        r'(?i)(?:we use|this (?:site|website) uses?) cookies?[^\n]{0,300}',
+        r'(?i)by (?:continuing|clicking|using)[^\n]{0,200}(?:cookies?|consent|privacy)',
+        r'(?i)cookie (?:policy|settings|preferences|notice)[^\n]{0,200}',
+        r'(?i)accept (?:all )?cookies?[^\n]{0,100}',
+        r'(?i)manage (?:cookie|consent|privacy)[^\n]{0,100}',
+        r'(?i)gdpr[^\n]{0,200}',
+    ]
+    for pat in cookie_patterns:
+        text = re.sub(pat, '', text)
+
+    # 6. Remove navigation-like lists (many short items separated by | or newlines)
+    text = re.sub(
+        r'(?:^|\n)(?:[^\n]{1,30}\s*\|\s*){3,}[^\n]{1,30}(?:\n|$)',
+        '\n', text,
+    )
+
+    # 7. Remove ad/CTA lines
+    text = re.sub(
+        r'(?im)^.*(?:subscribe|sign up|newsletter|download now|buy now|add to cart|'
+        r'free trial|limited time|click here|learn more|get started).*$',
+        '', text,
+    )
+
+    # 8. Remove lines that are mostly non-alphabetic (code, data tables, hashes)
+    cleaned_lines = []
+    for line in text.split('\n'):
+        stripped = line.strip()
+        if not stripped:
+            cleaned_lines.append('')
+            continue
+        alpha_chars = sum(1 for c in stripped if c.isalpha())
+        alpha_ratio = alpha_chars / max(len(stripped), 1)
+        # Keep lines that are at least 40% alphabetic or very short (headings)
+        if alpha_ratio >= 0.4 or len(stripped) < 20:
+            cleaned_lines.append(line)
+    text = '\n'.join(cleaned_lines)
+
+    # 9. Collapse excessive whitespace
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    text = text.strip()
+
+    return text
+
+
+# Expose as module-level alias for ContentExtractor
+clean_extracted_text = _clean_extracted_text
+
+
 def _extract_worker_fn(item_tuple):
     """
     Top-level extraction function for ProcessPoolExecutor.
 
     Must be module-level (not a method) for pickling.
     Each subprocess imports trafilatura independently.
+
+    Uses favor_recall for maximum content completeness, deduplicate
+    to strip repeated boilerplate, and post-processing to remove
+    non-human-language artifacts.
 
     Args:
         item_tuple: (url, html, metadata) - the item to extract
@@ -708,7 +789,10 @@ def _extract_worker_fn(item_tuple):
     # Handle pre-extracted text passthrough
     if metadata and metadata.get('pre_extracted') and metadata.get('text'):
         text = metadata['text']
+        text = _clean_extracted_text(text)
         raw_hash = hashlib.sha256(text.encode('utf-8', errors='ignore')).hexdigest()
+        if len(text) < 100:
+            return None
         return (url, text, metadata, raw_hash)
 
     if not html:
@@ -722,8 +806,10 @@ def _extract_worker_fn(item_tuple):
         text = trafilatura.extract(
             html,
             include_comments=False,
-            include_tables=False,
-            url=url
+            include_tables=True,
+            favor_recall=True,
+            deduplicate=True,
+            url=url,
         )
 
         if not text:
@@ -762,8 +848,8 @@ def _extract_worker_fn(item_tuple):
     if not text:
         return None
 
-    # Final cleanup
-    text = re.sub(r'\n\s*\n', '\n\n', text).strip()
+    # Post-process for cleanliness
+    text = _clean_extracted_text(text)
 
     # Min length guard
     if len(text) < 100:
@@ -989,6 +1075,13 @@ class AsyncFetcher(threading.Thread):
 
     def _sync_fallback_loop(self):
         """Synchronous fallback when aiohttp is not installed."""
+        try:
+            import requests
+        except ImportError:
+            logger.error("requests not installed; cannot run synchronous fetcher")
+            self.running = False
+            raise RuntimeError("requests dependency is required for synchronous fetching")
+
         while self.running or self._draining or not self.input_queue.empty():
             try:
                 item = self.input_queue.get(timeout=0.5)
@@ -1015,7 +1108,6 @@ class AsyncFetcher(threading.Thread):
 
             # Synchronous fetch
             try:
-                import requests
                 response = requests.get(url, timeout=self.timeout, headers={
                     'User-Agent': 'TruthAtlas/1.0 (Research Crawler)',
                 })

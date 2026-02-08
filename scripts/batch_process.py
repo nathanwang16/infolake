@@ -70,6 +70,11 @@ def main():
         default=config.get("batch_processing.embed_queue_size"),
         help="Embedding queue capacity"
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume using existing database entries (no deletes)"
+    )
     
     args = parser.parse_args()
     
@@ -102,6 +107,7 @@ def main():
         logger.info(f"Dump {i+1}: {p}")
     logger.info(f"Workers: {args.workers}")
     logger.info(f"Limit: {args.limit if args.limit > 0 else 'None'}")
+    logger.info(f"Resume: {args.resume}")
     logger.info("=" * 60)
     
     # Run pipeline (use first dump for now, MultiProducer support in pipeline)
@@ -111,7 +117,8 @@ def main():
         limit=args.limit,
         url_queue_size=args.url_queue_size,
         embed_queue_size=args.embed_queue_size,
-        additional_dumps=validated_paths[1:] if len(validated_paths) > 1 else None
+        additional_dumps=validated_paths[1:] if len(validated_paths) > 1 else None,
+        resume=args.resume,
     )
     
     stats = pipeline.run()

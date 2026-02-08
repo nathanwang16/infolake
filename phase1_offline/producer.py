@@ -23,7 +23,7 @@ from common.logging.logger import get_logger
 from common.config import config
 from common.database import db
 from common.models import DumpJob
-from common.repositories import JobRepository
+from common.repositories import JobRepository, DocumentRepository
 from phase1_offline.dump_adapters import adapter_registry, DumpRecord
 from phase1_offline.deduplication import BloomFilter, URLCanonicalizer
 
@@ -190,6 +190,8 @@ class Producer:
         expected_urls: int = 1_000_000,
         database=None,
         job_repo=None,
+        resume: bool = False,
+        doc_repo=None,
     ):
         if url_queue is None:
             raise ValueError("url_queue is required")
@@ -201,13 +203,16 @@ class Producer:
         self.job_id = job_id or str(uuid.uuid4())[:8]
         self.limit = limit
         self.running = False
+        self.resume = resume
 
         # DI
         self._database = database or db
         self._job_repo = job_repo or JobRepository(self._database)
+        self._doc_repo = doc_repo or DocumentRepository(self._database)
 
         # Initialize components
         self.bloom_filter = BloomFilter(expected_urls)
+        self._resume_loaded = False
 
         # Statistics
         self._stats = {
@@ -215,6 +220,7 @@ class Producer:
             'duplicates': 0,
             'queued': 0,
             'with_html': 0,
+            'resume_loaded': 0,
         }
         
         logger.info(f"Producer initialized for {dump_path} (job_id={self.job_id})")
@@ -224,6 +230,9 @@ class Producer:
         self.running = True
         logger.info(f"Producer starting for {self.dump_path}")
         
+        if self.resume and not self._resume_loaded:
+            self._load_existing_urls()
+
         # Register job in database
         self._register_job()
         
@@ -248,10 +257,17 @@ class Producer:
                 self.bloom_filter.add(canonical_url)
                 
                 # Create queue item
+                item_metadata = record.metadata or {}
+                item_metadata.update({
+                    'url': canonical_url,
+                    'source_dump': str(self.dump_path),
+                    'source_dump_name': self.dump_path.name,
+                    'job_id': self.job_id,
+                })
                 item = QueueItem(
                     url=canonical_url,
                     html=record.html,
-                    metadata=record.metadata or {},
+                    metadata=item_metadata,
                     job_id=self.job_id
                 )
                 
@@ -281,6 +297,23 @@ class Producer:
             raise
         finally:
             self.running = False
+
+    def _load_existing_urls(self):
+        """Loads existing URLs from database into Bloom filter for resume."""
+        logger.info("Loading existing URLs from database for resume...")
+        loaded = 0
+        try:
+            for batch in self._doc_repo.iter_canonical_urls(batch_size=5000):
+                for url in batch:
+                    self.bloom_filter.add(url)
+                loaded += len(batch)
+        except Exception as e:
+            logger.error(f"Failed to load existing URLs for resume: {e}")
+            raise
+
+        self._stats['resume_loaded'] = loaded
+        self._resume_loaded = True
+        logger.info(f"Resume loaded {loaded} existing URLs into Bloom filter")
     
     def stop(self):
         """Signals the producer to stop."""
@@ -333,7 +366,10 @@ class MultiProducer:
         url_queue: Queue,
         dump_paths: List[str],
         limit_per_dump: int = 0,
-        total_limit: int = 0
+        total_limit: int = 0,
+        resume: bool = False,
+        database=None,
+        doc_repo=None,
     ):
         if url_queue is None:
             raise ValueError("url_queue is required")
@@ -344,10 +380,15 @@ class MultiProducer:
         self.dump_paths = [Path(p) for p in dump_paths]
         self.limit_per_dump = limit_per_dump
         self.total_limit = total_limit
+        self.resume = resume
+
+        self._database = database or db
+        self._doc_repo = doc_repo or DocumentRepository(self._database)
         
         # Shared deduplication across dumps
         total_expected = len(dump_paths) * 1_000_000
         self.bloom_filter = BloomFilter(total_expected)
+        self._resume_loaded = False
         
         self._total_queued = 0
         self.running = False
@@ -355,6 +396,9 @@ class MultiProducer:
     def start(self):
         """Processes all dump files sequentially."""
         self.running = True
+
+        if self.resume and not self._resume_loaded:
+            self._load_existing_urls()
         
         for dump_path in self.dump_paths:
             if not self.running:
@@ -370,7 +414,8 @@ class MultiProducer:
             producer = Producer(
                 url_queue=self.url_queue,
                 dump_path=str(dump_path),
-                limit=self.limit_per_dump
+                limit=self.limit_per_dump,
+                resume=False,
             )
             
             # Share deduplication state
@@ -388,3 +433,19 @@ class MultiProducer:
     def stop(self):
         """Signals to stop processing."""
         self.running = False
+
+    def _load_existing_urls(self):
+        """Loads existing URLs into shared Bloom filter for resume."""
+        logger.info("MultiProducer loading existing URLs from database for resume...")
+        loaded = 0
+        try:
+            for batch in self._doc_repo.iter_canonical_urls(batch_size=5000):
+                for url in batch:
+                    self.bloom_filter.add(url)
+                loaded += len(batch)
+        except Exception as e:
+            logger.error(f"Failed to load existing URLs for resume: {e}")
+            raise
+
+        self._resume_loaded = True
+        logger.info(f"Resume loaded {loaded} existing URLs into shared Bloom filter")

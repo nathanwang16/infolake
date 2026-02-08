@@ -46,6 +46,23 @@ class DocumentRepository:
         finally:
             conn.close()
 
+    def get_by_ids(self, doc_ids: List[str]) -> List[Document]:
+        if not doc_ids:
+            return []
+        conn = self._db.get_connection()
+        try:
+            cursor = conn.cursor()
+            placeholders = ",".join(["?"] * len(doc_ids))
+            cursor.execute(f"""
+                SELECT id, canonical_url, title, summary, domain,
+                       detected_content_type, quality_score, wilson_score,
+                       importance_score, cluster_id, created_at
+                FROM documents WHERE id IN ({placeholders})
+            """, doc_ids)
+            return [Document.from_row(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
     def get_list(
         self,
         limit: int = 100,
@@ -214,12 +231,12 @@ class DocumentRepository:
             conn.close()
 
     def get_export_fields(self, doc_id: str) -> Optional[Dict]:
-        """Returns url, title, domain, content_type for JSON export."""
+        """Returns url, title, domain, content_type, summary for JSON export."""
         conn = self._db.get_connection()
         try:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT canonical_url, title, domain, detected_content_type
+                SELECT canonical_url, title, summary, domain, detected_content_type
                 FROM documents WHERE id = ?
             """, (doc_id,))
             row = cursor.fetchone()
@@ -228,8 +245,9 @@ class DocumentRepository:
             return {
                 'url': row[0],
                 'title': row[1],
-                'domain': row[2],
-                'content_type': row[3],
+                'summary': row[2],
+                'domain': row[3],
+                'content_type': row[4],
             }
         finally:
             conn.close()
@@ -240,6 +258,22 @@ class DocumentRepository:
             cursor = conn.cursor()
             cursor.execute("SELECT id FROM documents ORDER BY RANDOM() LIMIT ?", (limit,))
             return [row[0] for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def iter_canonical_urls(self, batch_size: int = 5000):
+        """Yields canonical URLs in batches for resume/dedup workflows."""
+        if batch_size is None:
+            raise ValueError("batch_size is required")
+        conn = self._db.get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT canonical_url FROM documents")
+            while True:
+                rows = cursor.fetchmany(batch_size)
+                if not rows:
+                    break
+                yield [row[0] for row in rows if row and row[0]]
         finally:
             conn.close()
 
@@ -257,14 +291,14 @@ class DocumentRepository:
                 (id, canonical_url, title, summary, content_hash, domain,
                  detected_content_type, quality_score, quality_components,
                  quality_profile_used, raw_html_hash, novelty_distance,
-                 source_phase, content_length, created_at, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'active')
+                 source_phase, source_dump, content_length, created_at, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'active')
             """, (
                 doc.id, doc.url, doc.title, doc.summary,
                 doc.content_hash, doc.domain, doc.content_type,
                 doc.quality_score, doc.quality_components,
                 doc.quality_profile_used, doc.raw_html_hash,
-                doc.novelty_distance, doc.source_phase, doc.content_length,
+                doc.novelty_distance, doc.source_phase, doc.source_dump, doc.content_length,
             ))
             if owns_conn:
                 conn.commit()
@@ -289,14 +323,14 @@ class DocumentRepository:
                     (id, canonical_url, title, summary, content_hash, domain,
                      detected_content_type, quality_score, quality_components,
                      quality_profile_used, raw_html_hash, novelty_distance,
-                     source_phase, content_length, created_at, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'active')
+                     source_phase, source_dump, content_length, created_at, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'active')
                 """, (
                     doc.id, doc.url, doc.title, doc.summary,
                     doc.content_hash, doc.domain, doc.content_type,
                     doc.quality_score, doc.quality_components,
                     doc.quality_profile_used, doc.raw_html_hash,
-                    doc.novelty_distance, doc.source_phase, doc.content_length,
+                    doc.novelty_distance, doc.source_phase, doc.source_dump, doc.content_length,
                 ))
             if owns_conn:
                 conn.commit()

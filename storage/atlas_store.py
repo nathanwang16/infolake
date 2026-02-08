@@ -30,6 +30,7 @@ from common.config import config
 from common.database import db
 from common.repositories import DocumentRepository
 from common.qdrant_manager import QdrantManager
+from common.meilisearch_manager import MeilisearchManager
 from storage.parquet_store import ParquetStore
 
 logger = get_logger("atlas_store")
@@ -42,9 +43,10 @@ class AtlasStore:
     Abstracts over SQLite, Qdrant, and Parquet storage.
     """
 
-    def __init__(self, database=None, qdrant_manager=None, doc_repo=None):
+    def __init__(self, database=None, qdrant_manager=None, meilisearch_manager=None, doc_repo=None):
         self._database = database or db
         self._qdrant_mgr = qdrant_manager or QdrantManager()
+        self._meili_mgr = meilisearch_manager or MeilisearchManager()
         self._doc_repo = doc_repo or DocumentRepository(self._database)
         self.parquet_store = ParquetStore()
 
@@ -111,6 +113,13 @@ class AtlasStore:
             order_by=order_by,
         )
         return [item.to_dict() for item in items]
+
+    def get_documents_by_ids(self, doc_ids: List[str]) -> List[Dict[str, Any]]:
+        """Gets documents by ID list (used for mapping enrichment)."""
+        if doc_ids is None:
+            raise ValueError("doc_ids is required")
+        docs = self._doc_repo.get_by_ids(doc_ids)
+        return [doc.to_dict() for doc in docs]
 
     def get_document_count(
         self,
@@ -204,9 +213,26 @@ class AtlasStore:
     # ==================== Search Operations ====================
 
     def search_text_documents(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
-        """Text search across document titles and URLs."""
+        """Text search across document titles and URLs (SQLite LIKE fallback)."""
         items = self._doc_repo.search_text(query, limit)
         return [item.to_dict() for item in items]
+
+    def search_meilisearch(
+        self,
+        query: str,
+        limit: int = 20,
+        offset: int = 0,
+        filter_str: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Full-text search via Meilisearch. Returns hits with metadata."""
+        return self._meili_mgr.search(
+            query=query, limit=limit, offset=offset, filter_str=filter_str,
+        )
+
+    @property
+    def meilisearch(self) -> MeilisearchManager:
+        """Exposes MeilisearchManager for direct access."""
+        return self._meili_mgr
 
     # ==================== Export Operations ====================
 

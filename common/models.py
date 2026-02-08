@@ -117,6 +117,7 @@ class DocumentCreate:
     raw_html_hash: str = ''
     novelty_distance: float = 0.0
     source_phase: str = 'batch'
+    source_dump: Optional[str] = None
     content_length: int = 0
 
 

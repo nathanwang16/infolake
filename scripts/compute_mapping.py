@@ -208,15 +208,22 @@ def main():
     importance_scores = []
     for doc_id in doc_ids:
         row = doc_repo.get_metadata_for_mapping(doc_id)
-        if row:
-            domain, quality_score, content_type = row
-            importance = pipeline.score_importance(
-                domain=domain or 'unknown',
-                quality_score=quality_score or 0.5,
-                content_type=content_type,
+        if not row:
+            logger.error(f"Missing metadata for document {doc_id}")
+            raise ValueError(f"Missing metadata for document {doc_id}")
+        domain, quality_score, content_type = row
+        if not domain or quality_score is None or not content_type:
+            logger.error(
+                "Missing required metadata for importance scoring "
+                f"(doc_id={doc_id}, domain={domain}, quality_score={quality_score}, "
+                f"content_type={content_type})"
             )
-        else:
-            importance = 0.5
+            raise ValueError(f"Missing required metadata for document {doc_id}")
+        importance = pipeline.score_importance(
+            domain=domain,
+            quality_score=quality_score,
+            content_type=content_type,
+        )
         importance_scores.append(importance)
     importance_scores = np.array(importance_scores)
 
@@ -233,7 +240,10 @@ def main():
     quality_scores = []
     for doc_id in doc_ids:
         qs = doc_repo.get_quality_score(doc_id)
-        quality_scores.append(qs if qs is not None else 0.5)
+        if qs is None:
+            logger.error(f"Missing quality_score for document {doc_id}")
+            raise ValueError(f"Missing quality_score for document {doc_id}")
+        quality_scores.append(qs)
 
     elapsed = time.time() - start_time
 
@@ -245,25 +255,29 @@ def main():
         'mapping_time_seconds': round(elapsed, 1),
     }
 
+    # Build export data with document metadata
+    export_data = []
+    for i, doc_id in enumerate(doc_ids):
+        entry = {
+            'doc_id': doc_id,
+            'x': float(coordinates[i, 0]),
+            'y': float(coordinates[i, 1]),
+            'z': float(importance_scores[i]),
+            'cluster_id': int(cluster_labels[i]),
+            'quality_score': float(quality_scores[i]),
+        }
+        fields = doc_repo.get_export_fields(doc_id)
+        if fields:
+            entry.update(fields)
+            summary = fields.get('summary')
+            if summary:
+                entry['excerpt'] = summary
+            entry.pop('summary', None)
+        export_data.append(entry)
+
     # Export
     if args.format in ['json', 'both']:
         json_path = args.output if args.output.endswith('.json') else str(output_path.with_suffix('.json'))
-
-        # Build export data with document metadata
-        export_data = []
-        for i, doc_id in enumerate(doc_ids):
-            entry = {
-                'doc_id': doc_id,
-                'x': float(coordinates[i, 0]),
-                'y': float(coordinates[i, 1]),
-                'z': float(importance_scores[i]),
-                'cluster_id': int(cluster_labels[i]),
-                'quality_score': float(quality_scores[i]),
-            }
-            fields = doc_repo.get_export_fields(doc_id)
-            if fields:
-                entry.update(fields)
-            export_data.append(entry)
 
         with open(json_path, 'w') as f:
             json.dump({
@@ -287,6 +301,11 @@ def main():
                 'z': [float(s) for s in importance_scores],
                 'cluster_id': [int(l) for l in cluster_labels],
                 'quality_score': quality_scores,
+                'url': [entry.get('url') for entry in export_data],
+                'title': [entry.get('title') for entry in export_data],
+                'domain': [entry.get('domain') for entry in export_data],
+                'content_type': [entry.get('content_type') for entry in export_data],
+                'excerpt': [entry.get('excerpt') for entry in export_data],
             }
             table = pa.table(data)
             pq.write_table(table, parquet_path)

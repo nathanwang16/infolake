@@ -29,6 +29,10 @@ CONFIG_SCHEMA: Dict[str, tuple] = {
     "qdrant.collection":            (str,   "atlas_embeddings"),
     "qdrant.quantization":          (str,   "scalar"),
     "qdrant.on_disk":               (bool,  True),
+    "qdrant.timeout_seconds":       (float, None),
+    "qdrant.batch_size":            (int,   None),
+    "qdrant.batch_timeout_seconds": (float, None),
+    "qdrant.write_queue_size":      (int,   None),
 
     # Embedding
     "embedding.model":              (str,   "BAAI/bge-small-en-v1.5"),
@@ -108,6 +112,10 @@ CONFIG_SCHEMA: Dict[str, tuple] = {
     "llm.provider":                 (str,   "openai"),
     "llm.model":                    (str,   "gpt-4o-mini"),
     "llm.api_key":                  (str,   None),
+
+    # Resource limits
+    "resource_limits.max_rss_gb":              (float, None),
+    "resource_limits.check_interval_seconds": (float, None),
 }
 
 
@@ -211,6 +219,18 @@ class Config:
                 return None
             if value is None:
                 return None
+        return value
+
+    def require(self, key: str) -> Any:
+        """
+        Requires a config value to be explicitly set in config.json.
+
+        Raises ValueError if missing.
+        """
+        value = self._get_raw(key)
+        if value is None:
+            logger.error(f"Missing required config key: {key}")
+            raise ValueError(f"Missing required config key: {key}")
         return value
 
 

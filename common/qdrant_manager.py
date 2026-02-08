@@ -29,13 +29,16 @@ class QdrantManager:
         self,
         url: Optional[str] = None,
         collection: Optional[str] = None,
-        timeout: int = 10,
+        timeout: Optional[float] = None,
         create_if_missing: bool = False,
         vector_size: int = 384,
     ):
         self._url = url or config.get("qdrant.url")
         self._collection = collection or config.get("qdrant.collection")
-        self._timeout = timeout
+        self._timeout = (
+            timeout if timeout is not None
+            else config.require("qdrant.timeout_seconds")
+        )
         self._create_if_missing = create_if_missing
         self._vector_size = vector_size
 

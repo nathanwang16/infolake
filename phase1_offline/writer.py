@@ -19,12 +19,13 @@ Key features:
 
 import hashlib
 import json
+import threading
 import time
 import uuid
 import zlib
 from datetime import datetime
 from pathlib import Path
-from queue import Queue, Empty
+from queue import Queue, Empty, Full
 from typing import Dict, Any, List, Optional
 from urllib.parse import urlparse
 import numpy as np
@@ -32,10 +33,10 @@ import numpy as np
 from common.logging.logger import get_logger
 from common.config import config
 from common.database import db
-from common.text_utils import extract_excerpt
 from common.models import DocumentCreate
 from common.repositories import DocumentRepository, DocumentTextRepository
 from common.qdrant_manager import QdrantManager
+from common.meilisearch_manager import MeilisearchManager
 
 logger = get_logger("writer")
 
@@ -158,6 +159,108 @@ class ContentArchiver:
         }
 
 
+class QdrantWriteWorker(threading.Thread):
+    """Background worker for batched Qdrant upserts."""
+
+    def __init__(
+        self,
+        qdrant_manager: QdrantManager,
+        input_queue: Queue,
+        batch_size: int,
+        batch_timeout_seconds: float,
+    ):
+        super().__init__(name="QdrantWriteWorker", daemon=True)
+
+        if qdrant_manager is None:
+            logger.error("qdrant_manager is required")
+            raise ValueError("qdrant_manager is required")
+        if input_queue is None:
+            logger.error("input_queue is required")
+            raise ValueError("input_queue is required")
+        if batch_size is None:
+            logger.error("batch_size is required")
+            raise ValueError("batch_size is required")
+        if batch_timeout_seconds is None:
+            logger.error("batch_timeout_seconds is required")
+            raise ValueError("batch_timeout_seconds is required")
+
+        self._qdrant_mgr = qdrant_manager
+        self._queue = input_queue
+        self._batch_size = batch_size
+        self._batch_timeout_seconds = batch_timeout_seconds
+        self.running = True
+
+        self._stats = {
+            'batches': 0,
+            'points': 0,
+            'errors': 0,
+        }
+
+    def run(self):
+        batch = []
+        last_flush = time.time()
+
+        while self.running or not self._queue.empty():
+            try:
+                item = self._queue.get(timeout=0.2)
+            except Empty:
+                item = None
+
+            if item is not None:
+                batch.append(item)
+                self._queue.task_done()
+
+            now = time.time()
+            should_flush = (
+                len(batch) >= self._batch_size or
+                (batch and now - last_flush >= self._batch_timeout_seconds)
+            )
+
+            if should_flush and batch:
+                self._flush_batch(batch)
+                batch = []
+                last_flush = now
+
+        if batch:
+            self._flush_batch(batch)
+
+    def _flush_batch(self, batch: List[Dict[str, Any]]):
+        if not self._qdrant_mgr.available:
+            self._stats['errors'] += len(batch)
+            return
+
+        try:
+            from qdrant_client.models import PointStruct
+
+            points = []
+            for item in batch:
+                qdrant_id = str(uuid.UUID(item['doc_id']))
+                points.append(
+                    PointStruct(
+                        id=qdrant_id,
+                        vector=item['embedding'],
+                        payload=item['payload'],
+                    )
+                )
+
+            result = self._qdrant_mgr.upsert(points=points)
+            if result is None:
+                self._stats['errors'] += len(batch)
+                return
+
+            self._stats['batches'] += 1
+            self._stats['points'] += len(points)
+        except Exception as e:
+            logger.debug(f"Qdrant batch upsert failed: {e}")
+            self._stats['errors'] += len(batch)
+
+    def stop(self):
+        self.running = False
+
+    def get_stats(self) -> Dict[str, int]:
+        return self._stats.copy()
+
+
 class Writer:
     """
     Single-threaded writer for the batch processing pipeline.
@@ -171,6 +274,7 @@ class Writer:
         embed_queue: Queue,
         database=None,
         qdrant_manager=None,
+        meilisearch_manager=None,
         doc_repo=None,
         text_repo=None,
     ):
@@ -182,7 +286,12 @@ class Writer:
 
         # DI
         self._database = database or db
-        self._qdrant_mgr = qdrant_manager or QdrantManager(create_if_missing=True, timeout=5)
+        qdrant_timeout = config.require("qdrant.timeout_seconds")
+        self._qdrant_mgr = qdrant_manager or QdrantManager(
+            create_if_missing=True,
+            timeout=qdrant_timeout,
+        )
+        self._meili_mgr = meilisearch_manager or MeilisearchManager(create_if_missing=True)
         self._doc_repo = doc_repo or DocumentRepository(self._database)
         self._text_repo = text_repo or DocumentTextRepository(self._database)
 
@@ -199,6 +308,13 @@ class Writer:
         self.qdrant_collection = self._qdrant_mgr.collection_name
         self._qdrant_available = self._qdrant_mgr.available
         self._qdrant_error_logged = False
+        self._qdrant_drop_logged = False
+
+        self._qdrant_batch_size = config.require("qdrant.batch_size")
+        self._qdrant_batch_timeout_seconds = config.require("qdrant.batch_timeout_seconds")
+        self._qdrant_write_queue_size = config.require("qdrant.write_queue_size")
+        self._qdrant_queue: Queue = Queue(maxsize=self._qdrant_write_queue_size)
+        self._qdrant_worker: Optional[QdrantWriteWorker] = None
 
         # Statistics
         self._stats = {
@@ -206,6 +322,9 @@ class Writer:
             'accepted': 0,
             'db_errors': 0,
             'qdrant_errors': 0,
+            'meili_errors': 0,
+            'qdrant_enqueued': 0,
+            'qdrant_dropped': 0,
         }
 
         logger.info("Writer initialized (store-only mode, scoring deferred)")
@@ -217,6 +336,8 @@ class Writer:
         # Create database connection in the writer thread for thread safety
         import sqlite3
         self.conn = sqlite3.connect(self._db_path)
+
+        self._start_qdrant_worker()
 
         logger.info("Writer started")
 
@@ -243,7 +364,17 @@ class Writer:
 
     def _on_shutdown(self):
         """Called at end of writer thread to flush buffers. Override in subclasses."""
-        pass
+        self._shutdown_qdrant_worker()
+        if self.conn:
+            try:
+                self.conn.commit()
+            except Exception as e:
+                logger.warning(f"Final commit failed: {e}")
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
 
     def _process_item(self, item: Dict[str, Any]):
         """Processes a single item from the embed queue."""
@@ -273,10 +404,19 @@ class Writer:
         except Exception as e:
             logger.debug(f"Text insert failed for {url}: {e}")
 
-        # 4. Save embedding to Qdrant
+        # 4. Commit document + text together
+        try:
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Commit failed for {url}: {e}")
+
+        # 5. Save embedding to Qdrant
         self._save_to_qdrant(doc_id, embedding, metadata)
 
-        # 5. Archive content
+        # 6. Index metadata in Meilisearch
+        self._save_to_meilisearch(doc_id, url, text, metadata)
+
+        # 7. Archive content
         archive_record = {
             'id': doc_id,
             'url': url,
@@ -307,13 +447,11 @@ class Writer:
     ):
         """Saves document to SQLite database."""
         try:
-            summary = extract_excerpt(text, max_words=80, prefer_first_paragraph=True)
-
             doc = DocumentCreate(
                 id=doc_id,
                 url=url,
                 title=metadata.get('title', ''),
-                summary=summary or '',
+                summary='',
                 content_hash=hashlib.md5(text.encode()).hexdigest(),
                 domain=self._get_domain(url),
                 content_type='unscored',
@@ -323,6 +461,7 @@ class Writer:
                 raw_html_hash=raw_html_hash,
                 novelty_distance=0.0,
                 source_phase='batch',
+                source_dump=metadata.get('source_dump'),
                 content_length=len(text),
             )
             self._doc_repo.insert(doc, conn=self.conn)
@@ -340,33 +479,55 @@ class Writer:
         """Saves embedding to Qdrant."""
         if not self._qdrant_mgr.available:
             return
+        if not self._qdrant_worker:
+            self._start_qdrant_worker()
+        if not self._qdrant_worker:
+            return
+
+        payload = {
+            'title': metadata.get('title', ''),
+            'url': metadata.get('url', ''),
+            'quality_score': 0.0,
+        }
+        try:
+            self._qdrant_queue.put_nowait({
+                'doc_id': doc_id,
+                'embedding': embedding.tolist(),
+                'payload': payload,
+            })
+            self._stats['qdrant_enqueued'] += 1
+        except Full:
+            self._stats['qdrant_dropped'] += 1
+            if not self._qdrant_drop_logged:
+                logger.warning("Qdrant write queue full; dropping embeddings")
+                self._qdrant_drop_logged = True
+
+    def _save_to_meilisearch(
+        self,
+        doc_id: str,
+        url: str,
+        text: str,
+        metadata: Dict,
+    ):
+        """Indexes document metadata in Meilisearch for full-text search."""
+        if not self._meili_mgr.available:
+            return
 
         try:
-            from qdrant_client.models import PointStruct
-
-            # Convert string doc_id to UUID for Qdrant
-            qdrant_id = str(uuid.UUID(doc_id))
-
-            self._qdrant_mgr.upsert(
-                points=[
-                    PointStruct(
-                        id=qdrant_id,
-                        vector=embedding.tolist(),
-                        payload={
-                            'title': metadata.get('title', ''),
-                            'url': metadata.get('url', ''),
-                            'quality_score': 0.0,
-                        }
-                    )
-                ]
-            )
-
+            self._meili_mgr.add_documents([{
+                'id': doc_id,
+                'title': metadata.get('title', ''),
+                'url': url,
+                'domain': self._get_domain(url),
+                'content_type': 'unscored',
+                'quality_score': 0.0,
+                'summary': '',
+                'cluster_id': None,
+            }])
         except Exception as e:
-            self._stats['qdrant_errors'] += 1
-            # Only log first error to avoid spam
-            if not self._qdrant_error_logged:
-                logger.warning(f"Qdrant write failed (further errors suppressed): {e}")
-                self._qdrant_error_logged = True
+            self._stats['meili_errors'] += 1
+            if not self._meili_mgr._error_logged:
+                logger.warning(f"Meilisearch index failed (further errors suppressed): {e}")
 
     def _get_domain(self, url: str) -> str:
         """Extracts domain from URL."""
@@ -381,13 +542,43 @@ class Writer:
 
     def get_stats(self) -> Dict[str, Any]:
         """Returns writer statistics."""
+        qdrant_worker_stats = (
+            self._qdrant_worker.get_stats()
+            if self._qdrant_worker else {}
+        )
         return {
             **self._stats,
             'archive_stats': self.archiver.get_stats(),
+            'qdrant_worker': qdrant_worker_stats,
+            'qdrant_errors_total': (
+                self._stats.get('qdrant_errors', 0) +
+                qdrant_worker_stats.get('errors', 0)
+            ),
             'acceptance_rate': (
                 self._stats['accepted'] / max(self._stats['received'], 1)
             ),
         }
+
+    def _start_qdrant_worker(self):
+        if not self._qdrant_mgr.available:
+            return
+        if self._qdrant_worker and self._qdrant_worker.is_alive():
+            return
+        self._qdrant_worker = QdrantWriteWorker(
+            qdrant_manager=self._qdrant_mgr,
+            input_queue=self._qdrant_queue,
+            batch_size=self._qdrant_batch_size,
+            batch_timeout_seconds=self._qdrant_batch_timeout_seconds,
+        )
+        self._qdrant_worker.start()
+
+    def _shutdown_qdrant_worker(self):
+        if not self._qdrant_worker:
+            return
+        self._qdrant_worker.stop()
+        self._qdrant_worker.join(timeout=30.0)
+        if self._qdrant_worker.is_alive():
+            logger.warning("Qdrant worker did not finish in time")
 
 
 class BatchWriter(Writer):
@@ -402,6 +593,7 @@ class BatchWriter(Writer):
         self.db_batch_size = db_batch_size
         self._db_buffer: List[Dict] = []
         self._text_buffer: List[tuple] = []
+        self._meili_buffer: List[Dict] = []
 
     def _save_to_db(self, **kwargs):
         """Buffers database writes."""
@@ -419,13 +611,11 @@ class BatchWriter(Writer):
             docs = []
             text_items = []
             for kwargs in self._db_buffer:
-                summary = extract_excerpt(kwargs['text'], max_words=80, prefer_first_paragraph=True)
-
                 doc = DocumentCreate(
                     id=kwargs['doc_id'],
                     url=kwargs['url'],
                     title=kwargs['metadata'].get('title', ''),
-                    summary=summary or '',
+                    summary='',
                     content_hash=hashlib.md5(kwargs['text'].encode()).hexdigest(),
                     domain=self._get_domain(kwargs['url']),
                     content_type='unscored',
@@ -435,6 +625,7 @@ class BatchWriter(Writer):
                     raw_html_hash=kwargs.get('raw_html_hash', ''),
                     novelty_distance=0.0,
                     source_phase='batch',
+                    source_dump=kwargs['metadata'].get('source_dump'),
                     content_length=len(kwargs['text']),
                 )
                 docs.append(doc)
@@ -442,6 +633,7 @@ class BatchWriter(Writer):
 
             self._doc_repo.insert_batch(docs, conn=self.conn)
             self._text_repo.insert_batch(text_items, conn=self.conn)
+            self.conn.commit()
             logger.debug(f"Flushed {len(self._db_buffer)} records to database")
 
         except Exception as e:
@@ -474,6 +666,9 @@ class BatchWriter(Writer):
         # Save embedding to Qdrant
         self._save_to_qdrant(doc_id, embedding, metadata)
 
+        # Buffer Meilisearch metadata
+        self._buffer_meilisearch(doc_id, url, text, metadata)
+
         # Archive content
         archive_record = {
             'id': doc_id,
@@ -489,6 +684,41 @@ class BatchWriter(Writer):
         if self._stats['accepted'] % 100 == 0:
             logger.info(f"Accepted {self._stats['accepted']} documents")
 
+    def _buffer_meilisearch(self, doc_id: str, url: str, text: str, metadata: Dict):
+        """Buffers a document for batch indexing into Meilisearch."""
+        self._meili_buffer.append({
+            'id': doc_id,
+            'title': metadata.get('title', ''),
+            'url': url,
+            'domain': self._get_domain(url),
+            'content_type': 'unscored',
+            'quality_score': 0.0,
+            'summary': '',
+            'cluster_id': None,
+        })
+        if len(self._meili_buffer) >= self.db_batch_size:
+            self._flush_meili_buffer()
+
+    def _flush_meili_buffer(self):
+        """Flushes buffered documents to Meilisearch."""
+        if not self._meili_buffer:
+            return
+        self._meili_mgr.add_documents(self._meili_buffer)
+        logger.debug(f"Flushed {len(self._meili_buffer)} documents to Meilisearch")
+        self._meili_buffer = []
+
     def _on_shutdown(self):
-        """Flushes buffers at end of writer thread."""
+        """Flushes buffers at end of writer thread, commits, and closes connection."""
+        self._shutdown_qdrant_worker()
         self._flush_db_buffer()
+        self._flush_meili_buffer()
+        if self.conn:
+            try:
+                self.conn.commit()
+            except Exception as e:
+                logger.warning(f"Final commit failed: {e}")
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None

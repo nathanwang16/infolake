@@ -454,3 +454,117 @@ print(mappings[0].cluster_label)  # "Machine Learning / Neural Networks"
 - sklearn (TF-IDF, feature extraction)
 - scipy (agglomerative clustering, linkage)
 - hdbscan (base clustering - already required)
+
+---
+
+## deck.gl Frontend Rewrite (Feb 2026)
+
+**Change:** Replaced Canvas-based rendering in `visualizer/static/index.html` with deck.gl
+(ScatterplotLayer + OrthographicView + LineLayer). Added pydeck (0.9.1) server-side for
+deck configuration and standalone HTML export.
+
+**New API endpoints:**
+- `GET /api/mapping-list` - Lists available mapping datasets for switching
+- `GET /api/export-html` - Exports standalone deck.gl visualization via pydeck
+
+**Key decisions:**
+- deck.gl JS loaded from CDN (`unpkg.com/deck.gl@^9.0.0/dist.min.js`) handles all rendering
+- OrthographicView (not MapView) since UMAP coordinates are non-geographic
+- pydeck used server-side for HTML export and data enrichment, not for live rendering
+- Server enriches parquet mapping data with document metadata before sending to frontend
+- Mapping switcher dropdown supports multiple datasets via `/api/mapping-list`
+
+**deck.gl gotcha:** `OrthographicView` zoom 0 = 1 unit per pixel. Compute initial zoom
+from `Math.log2(viewportSize / dataRange)` to fit all points.
+
+## 2026-02-06: Resume Safety + Placeholder Removal
+
+**Bugs Fixed:**
+1. **Mock fetch/embedding paths** (`phase1_offline/worker.py`)
+   - Issue: Missing dependencies silently returned mock HTML/embeddings
+   - Fix: Raise explicit errors, stop workers/embedder when dependencies are missing
+
+2. **Resume dedup missing** (`phase1_offline/producer.py`, `common/repositories.py`)
+   - Issue: Phase 1 restarts could reprocess already-ingested URLs
+   - Fix: Load existing canonical URLs into Bloom filter for resume-safe runs
+
+3. **Source dump provenance** (`phase1_offline/writer.py`, `common/models.py`, `common/repositories.py`)
+   - Issue: Documents were missing `source_dump` metadata for traceability
+   - Fix: Persist `source_dump` from producer metadata into SQLite
+
+## 2026-02-07: Mapping Metadata Gaps After Resume
+
+**Problem:** Visualizer showed hex doc IDs, missing URLs, and 50% default scores.
+
+**Root causes:**
+1. Parquet mapping exports omitted URL/title/domain/content type metadata.
+2. Mapping enrichment in `visualizer/server.py` fetched documents by limit, not by doc_id.
+3. Mapping script defaulted missing scores to `0.5`, masking data issues.
+
+**Fix:**
+1. Export metadata (url/title/domain/content_type/excerpt) into Parquet mappings.
+2. Enrich mappings by doc_id list and log missing DB documents.
+3. Raise explicit errors when quality/metadata is missing instead of defaulting.
+
+## 2026-02-07: Empty document_texts Table (Critical)
+
+**Problem:** `document_texts` had 0 rows despite 38,984 documents in `documents` table.
+Post-processor scoring (deferred scoring pipeline) depends on full text in `document_texts`.
+
+**Root cause:** `BatchWriter._flush_db_buffer()` and base `Writer._process_item()` passed
+`conn=self.conn` to both `_doc_repo.insert_batch()` and `_text_repo.insert_batch()`.
+Neither repository committed (since `owns_conn=False`), and the writer never called
+`self.conn.commit()`. Python's sqlite3 with `isolation_level=""` requires explicit commit.
+Without it, inserts were silently lost when the connection was garbage-collected.
+
+**Fix:**
+1. Added `self.conn.commit()` in `_flush_db_buffer()` after batch inserts.
+2. Added `self.conn.commit()` after each item in base Writer.
+3. Added `self.conn.commit()` + `self.conn.close()` in `_on_shutdown()`.
+4. Stopped computing `summary` during ingestion (leave empty; full text in `document_texts`).
+5. Created `scripts/backfill_texts.py` to populate `document_texts` from parsed archive.
+
+**Backfill:** `python scripts/backfill_texts.py` reads 165 archive files (~165K records) and
+inserts texts for existing documents missing from `document_texts`.
+
+## 2026-02-07: Extraction Quality Improvements
+
+**Problem:** Extracted texts were short, incomplete, contained ads, cookie banners,
+navigation lists, CSS/JS code fragments, and other non-human-language artifacts.
+
+**Root cause:** trafilatura was called with `include_tables=False` and default precision
+mode, producing truncated output. No post-processing cleaned boilerplate.
+
+**Fix (both `_extract_worker_fn` and `ContentExtractor.extract`):**
+1. `favor_recall=True` — maximizes content completeness.
+2. `include_tables=True` — includes table data (often contains real content).
+3. `deduplicate=True` — strips repeated boilerplate paragraphs.
+4. Added `_clean_extracted_text()` post-processor that removes:
+   - Fenced code blocks and inline code
+   - Surviving HTML/XML fragments and HTML entities
+   - CSS selectors, property blocks, and media queries
+   - Cookie/consent/GDPR banner text
+   - Navigation-style pipe-separated lists
+   - Ad/CTA lines (subscribe, buy now, download, etc.)
+   - Lines that are <40% alphabetic (code, data hashes, etc.)
+   - Excessive whitespace
+
+**Tested:** Real SLOP extraction on sample-test-50.tar shows clean human-language output.
+
+## 2026-02-08: Qdrant Writer Stall + Memory Cap
+
+**Problem:** Long-running Phase 1 runs stalled when Qdrant became unstable, backing up
+the embedding queue and steadily degrading throughput. macOS also warned about
+high RAM usage.
+
+**Fix:**
+1. **Memory governor (18GB cap):** Added a process-tree RSS monitor that exits the
+   pipeline gracefully when the cap is exceeded.
+2. **Async Qdrant batching:** Writer now enqueues embeddings to a dedicated Qdrant
+   batch worker, preventing the writer thread from blocking.
+3. **Queue backpressure:** Qdrant queue is bounded; when full, embeddings are dropped
+   with warnings to prevent unbounded memory growth.
+
+**Config added:**
+- `resource_limits.*` (max_rss_gb, check_interval_seconds)
+- `qdrant.*` (timeout_seconds, batch_size, batch_timeout_seconds, write_queue_size)

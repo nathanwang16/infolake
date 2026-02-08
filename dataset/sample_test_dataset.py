@@ -84,23 +84,25 @@ def sample_tar(source_tar: Path, output_tar: Path, sample_size: int, seed: int |
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Sample random entries from a tar archive"
+        description="Sample random entries from a tar archive (default: 200 samples)"
     )
     parser.add_argument(
         "source",
         type=Path,
-        help="Source tar archive path"
+        help="Source tar archive path (marginalia dump)"
     )
     parser.add_argument(
         "output",
         type=Path,
-        help="Output tar archive path"
+        nargs="?",
+        default=None,
+        help="Output tar archive path (default: dataset/sample-test-{N}.tar)"
     )
     parser.add_argument(
         "-n", "--sample-size",
         type=int,
-        required=True,
-        help="Number of samples to extract"
+        default=200,
+        help="Number of samples to extract (default: 200)"
     )
     parser.add_argument(
         "-s", "--seed",
@@ -110,6 +112,12 @@ def main() -> None:
     )
     
     args = parser.parse_args()
+    
+    # Auto-generate output filename if not provided
+    if args.output is None:
+        script_dir = Path(__file__).parent
+        args.output = script_dir / f"sample-test-{args.sample_size}.tar"
+        logger.info(f"Auto-generated output path: {args.output}")
     
     try:
         sample_tar(

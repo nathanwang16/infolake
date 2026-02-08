@@ -3,41 +3,52 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Truth Atlas - Semantic Map</title>
+    <title>Truth Atlas</title>
+    <script src="https://unpkg.com/deck.gl@^9.0.0/dist.min.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { 
+        html, body { height: 100%; overflow: hidden; }
+        body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #1a1a2e; 
-            color: #eee; 
-            min-height: 100vh;
+            background: #1a1a2e;
+            color: #eee;
         }
-        .container { max-width: 1800px; margin: 0 auto; padding: 15px; }
-        .main-content { display: grid; grid-template-columns: 320px 1fr; gap: 15px; }
-        
-        .sidebar { 
-            background: #16213e; 
-            border-radius: 8px; 
+        .app { display: flex; height: 100vh; }
+
+        /* Sidebar */
+        .sidebar {
+            width: 320px;
+            flex-shrink: 0;
+            background: #16213e;
             padding: 15px;
-            height: fit-content;
-            max-height: calc(100vh - 30px);
             overflow-y: auto;
+            border-right: 1px solid #0f0f23;
+            transition: width 0.25s ease, padding 0.25s ease;
         }
-        .sidebar h2 { 
-            font-size: 14px; 
-            margin-bottom: 12px; 
-            color: #00d4ff; 
+        .sidebar.collapsed { width: 42px; padding: 8px 5px; overflow: hidden; }
+        .sidebar.collapsed .sidebar-content { display: none; }
+        .sidebar-header {
             display: flex;
             align-items: center;
-            gap: 8px;
+            justify-content: space-between;
+            margin-bottom: 12px;
         }
-        .sidebar h2 .toggle-icon {
+        .sidebar.collapsed .sidebar-header { justify-content: center; }
+        .sidebar-toggle {
+            width: 28px; height: 28px;
+            background: #0f0f23;
+            border: 1px solid #333;
+            border-radius: 4px;
+            color: #888;
             cursor: pointer;
-            font-size: 12px;
-            transition: transform 0.2s;
+            font-size: 14px;
+            flex-shrink: 0;
+            transition: color 0.2s;
         }
-        .sidebar h2 .toggle-icon.collapsed { transform: rotate(-90deg); }
-        
+        .sidebar-toggle:hover { color: #00d4ff; }
+        .sidebar-title { font-size: 15px; font-weight: bold; color: #00d4ff; }
+        .sidebar.collapsed .sidebar-title { display: none; }
+        .sidebar h2 { font-size: 14px; margin-bottom: 12px; color: #00d4ff; }
         .stats-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
@@ -52,7 +63,6 @@
         }
         .stat-value { font-size: 20px; font-weight: bold; color: #00d4ff; }
         .stat-label { font-size: 10px; color: #888; margin-top: 3px; }
-        
         .filter-group { margin-bottom: 15px; }
         .filter-group label { display: block; font-size: 11px; color: #888; margin-bottom: 6px; }
         .filter-group select, .filter-group input[type="range"] {
@@ -63,1164 +73,758 @@
             border-radius: 4px;
             color: #eee;
         }
-        
-        /* Hierarchy Tree */
-        .hierarchy-tree { 
-            list-style: none; 
-            max-height: 400px; 
-            overflow-y: auto;
-            margin-bottom: 15px;
-        }
-        .hierarchy-parent {
-            margin-bottom: 8px;
-        }
-        .hierarchy-label {
+
+        /* Cluster list */
+        .cluster-list { list-style: none; max-height: 50vh; overflow-y: auto; }
+        .cluster-item {
             display: flex;
             justify-content: space-between;
-            align-items: center;
-            padding: 10px 12px;
+            padding: 8px 10px;
+            margin: 4px 0;
             background: #0f0f23;
-            border-radius: 6px;
+            border-radius: 4px;
             cursor: pointer;
-            transition: all 0.2s;
+            transition: background 0.2s;
             font-size: 13px;
             border-left: 3px solid transparent;
         }
-        .hierarchy-label:hover { background: #1a1a3e; }
-        .hierarchy-label.active { 
-            background: #00d4ff22; 
-            border-left-color: #00d4ff;
-        }
-        .hierarchy-label .label-text {
-            display: flex;
-            flex-direction: column;
-            gap: 2px;
-        }
-        .hierarchy-label .label-name {
-            font-weight: 500;
-        }
-        .hierarchy-label .label-keywords {
-            font-size: 10px;
-            color: #888;
-        }
-        .hierarchy-label .label-count {
-            color: #888;
-            font-size: 11px;
-            white-space: nowrap;
-        }
-        
-        .hierarchy-children {
-            list-style: none;
-            margin-left: 16px;
-            margin-top: 4px;
-            border-left: 1px solid #333;
-            padding-left: 12px;
-        }
-        .hierarchy-child {
-            padding: 6px 10px;
-            margin: 2px 0;
-            background: #0f0f2399;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 12px;
-            display: flex;
-            justify-content: space-between;
-            transition: all 0.2s;
-        }
-        .hierarchy-child:hover { background: #1a1a3e; }
-        .hierarchy-child.active { 
-            background: #00d4ff22; 
-            color: #00d4ff;
-        }
-        
-        /* Cluster relationships */
-        .relationships-section {
-            margin-top: 15px;
-            padding-top: 15px;
-            border-top: 1px solid #333;
-        }
-        .relationship-item {
-            display: flex;
-            align-items: center;
-            padding: 6px 8px;
-            font-size: 11px;
-            color: #aaa;
-            gap: 8px;
-        }
-        .relationship-item .rel-type {
-            padding: 2px 6px;
-            border-radius: 3px;
-            font-size: 9px;
-            text-transform: uppercase;
-        }
-        .rel-type.similar { background: #00ff8833; color: #00ff88; }
-        .rel-type.related { background: #ffd93d33; color: #ffd93d; }
-        .rel-type.sibling { background: #00d4ff33; color: #00d4ff; }
-        
-        .main-panel { 
-            background: #16213e; 
-            border-radius: 8px; 
-            padding: 15px;
-            min-height: calc(100vh - 30px);
-            display: flex;
-            flex-direction: column;
-        }
-        
-        .tab-bar { display: flex; gap: 8px; margin-bottom: 15px; }
+        .cluster-item:hover { background: #1a1a3e; }
+        .cluster-item.active { background: #00d4ff22; border-left-color: #00d4ff; }
+        .cluster-count { color: #888; font-size: 11px; }
+
+        /* View tabs (inside sidebar) */
+        .view-tabs { display: flex; gap: 6px; margin-bottom: 15px; }
         .tab {
-            padding: 8px 16px;
+            flex: 1;
+            padding: 7px 0;
             background: #0f0f23;
             border: none;
             border-radius: 4px;
             color: #888;
             cursor: pointer;
-            font-size: 13px;
+            font-size: 12px;
+            text-align: center;
         }
         .tab.active { background: #00d4ff; color: #000; }
-        
-        #map-container {
-            flex: 1;
-            background: #0f0f23;
-            border-radius: 8px;
-            position: relative;
-            overflow: hidden;
-            cursor: grab;
-            min-height: 500px;
-        }
-        #map-container:active { cursor: grabbing; }
-        
-        #map-canvas {
-            position: absolute;
-            top: 0; left: 0;
-            width: 100%; height: 100%;
-        }
-        
+
+        /* Main panel */
+        .main-panel { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+        /* deck.gl container */
+        #deck-container { flex: 1; position: relative; background: #0f0f23; overflow: hidden; }
+        #deck-container canvas { outline: none; }
         .map-controls {
-            position: absolute;
-            bottom: 10px; right: 10px;
-            display: flex;
-            gap: 5px;
-            z-index: 50;
+            position: absolute; bottom: 15px; right: 15px;
+            display: flex; gap: 5px; z-index: 10;
         }
         .map-btn {
             width: 32px; height: 32px;
-            background: #16213e;
+            background: #16213ecc;
             border: 1px solid #333;
             border-radius: 4px;
             color: #eee;
             cursor: pointer;
             font-size: 16px;
         }
-        .map-btn:hover { background: #1a1a3e; }
-        
+        .map-btn:hover { background: #1a1a3ecc; }
         .zoom-info {
-            position: absolute;
-            top: 10px; left: 10px;
+            position: absolute; top: 10px; left: 345px;
             background: #16213ecc;
             padding: 5px 10px;
             border-radius: 4px;
             font-size: 11px;
             color: #888;
+            z-index: 10;
         }
-        
-        /* Active cluster info panel */
-        .cluster-info-panel {
+
+        /* Search panel (overlays map, left side) */
+        .search-panel {
             position: absolute;
             top: 10px;
-            right: 10px;
-            background: #16213eee;
-            padding: 12px 15px;
-            border-radius: 8px;
-            max-width: 280px;
-            display: none;
-            border: 1px solid #333;
-        }
-        .cluster-info-panel.visible { display: block; }
-        .cluster-info-panel h3 {
-            color: #00d4ff;
-            font-size: 14px;
-            margin-bottom: 8px;
-        }
-        .cluster-info-panel .keywords {
+            left: 10px;
+            width: 320px;
+            z-index: 15;
             display: flex;
-            flex-wrap: wrap;
-            gap: 4px;
-            margin-bottom: 8px;
+            flex-direction: column;
+            pointer-events: auto;
         }
-        .cluster-info-panel .keyword-tag {
-            padding: 2px 8px;
-            background: #00d4ff22;
-            border-radius: 10px;
+        .search-bar {
+            display: flex;
+            align-items: center;
+            background: rgba(22, 33, 62, 0.85);
+            border: 1px solid #333;
+            border-radius: 6px;
+            padding: 7px 10px;
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+        }
+        .search-bar.has-results {
+            border-radius: 6px 6px 0 0;
+        }
+        .search-icon {
+            width: 14px;
+            height: 14px;
+            flex-shrink: 0;
+            margin-right: 8px;
+            opacity: 0.5;
+        }
+        .search-bar input {
+            flex: 1;
+            background: transparent;
+            border: none;
+            outline: none;
+            color: #eee;
+            font-size: 13px;
+            font-family: inherit;
+        }
+        .search-bar input::placeholder { color: #555; }
+        .search-clear {
+            background: none;
+            border: none;
+            color: #666;
+            cursor: pointer;
+            font-size: 18px;
+            padding: 0 2px;
+            line-height: 1;
+            display: none;
+        }
+        .search-clear.visible { display: block; }
+        .search-clear:hover { color: #00d4ff; }
+        .search-meta {
+            padding: 5px 10px;
             font-size: 10px;
-            color: #00d4ff;
-        }
-        .cluster-info-panel .meta {
-            font-size: 11px;
             color: #888;
+            background: rgba(22, 33, 62, 0.88);
+            border: 1px solid #333;
+            border-top: none;
+            display: none;
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
         }
-        
-        .document-list { list-style: none; overflow-y: auto; flex: 1; }
+        .search-meta.visible { display: block; }
+        .search-results {
+            max-height: 55vh;
+            overflow-y: auto;
+            background: rgba(22, 33, 62, 0.92);
+            border: 1px solid #333;
+            border-top: none;
+            border-radius: 0 0 6px 6px;
+            display: none;
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+        }
+        .search-results.visible { display: block; }
+        .search-results::-webkit-scrollbar { width: 4px; }
+        .search-results::-webkit-scrollbar-track { background: transparent; }
+        .search-results::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+        .search-result-item {
+            padding: 8px 12px;
+            cursor: pointer;
+            border-bottom: 1px solid rgba(255,255,255,0.04);
+            transition: background 0.15s;
+        }
+        .search-result-item:hover { background: rgba(0,212,255,0.08); }
+        .search-result-item:last-child { border-bottom: none; }
+        .search-result-title {
+            font-size: 12px;
+            color: #ddd;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .search-result-meta {
+            font-size: 10px;
+            color: #666;
+            margin-top: 2px;
+        }
+
+        /* List view */
+        #list-view { display: none; flex: 1; flex-direction: column; overflow-y: auto; padding: 15px; }
+        .document-list { list-style: none; }
         .document-item {
-            padding: 12px;
-            margin: 8px 0;
-            background: #0f0f23;
-            border-radius: 4px;
+            padding: 12px; margin: 8px 0;
+            background: #0f0f23; border-radius: 4px;
             border-left: 3px solid #00d4ff;
         }
         .document-title { font-size: 14px; margin-bottom: 4px; }
         .document-title a { color: #00d4ff; text-decoration: none; }
         .document-title a:hover { text-decoration: underline; }
         .document-meta { font-size: 11px; color: #888; }
-        .document-cluster {
-            display: inline-block;
-            padding: 2px 8px;
-            background: #00d4ff22;
-            border-radius: 10px;
-            font-size: 10px;
-            color: #00d4ff;
-            margin-left: 8px;
-        }
         .quality-badge {
-            display: inline-block;
-            padding: 2px 6px;
-            border-radius: 8px;
-            font-size: 10px;
-            margin-left: 8px;
+            display: inline-block; padding: 2px 6px;
+            border-radius: 8px; font-size: 10px; margin-left: 8px;
         }
         .quality-high { background: #00ff88; color: #000; }
         .quality-medium { background: #ffcc00; color: #000; }
         .quality-low { background: #ff4444; color: #fff; }
-        
-        .tooltip {
-            position: fixed;
-            background: #000e;
-            padding: 12px 14px;
-            border-radius: 6px;
-            font-size: 12px;
-            max-width: 400px;
-            z-index: 1000;
-            pointer-events: none;
-            display: none;
-            border: 1px solid #333;
-            line-height: 1.5;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+
+        /* Loading */
+        .load-overlay {
+            position: absolute; inset: 0;
+            display: flex; align-items: center; justify-content: center;
+            background: #0f0f23; z-index: 5;
+            flex-direction: column; gap: 12px;
         }
-        .tooltip-title { color: #00d4ff; font-weight: bold; margin-bottom: 6px; font-size: 13px; }
-        .tooltip-cluster {
-            display: inline-block;
-            padding: 2px 8px;
-            background: #00d4ff22;
-            border-radius: 10px;
-            font-size: 10px;
-            color: #00d4ff;
-            margin-bottom: 8px;
-        }
-        .tooltip-path {
-            font-size: 10px;
-            color: #888;
-            margin-bottom: 8px;
-        }
-        .tooltip-path span { color: #00d4ff; }
-        .tooltip-excerpt { 
-            color: #ccc; 
-            font-size: 11px; 
-            margin: 10px 0; 
-            font-style: italic; 
-            line-height: 1.6;
-            border-left: 2px solid #00d4ff33;
-            padding-left: 10px;
-        }
-        .tooltip-meta { color: #888; font-size: 10px; margin-top: 8px; }
-        
-        #list-view { display: none; flex: 1; flex-direction: column; }
-        
+        .load-overlay.hidden { display: none; }
+        .load-text { color: #888; font-size: 13px; }
         .spinner {
             width: 40px; height: 40px;
-            border: 3px solid #333;
-            border-top-color: #00d4ff;
+            border: 3px solid #333; border-top-color: #00d4ff;
             border-radius: 50%;
             animation: spin 1s linear infinite;
-            margin: 50px auto;
         }
         @keyframes spin { to { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="main-content">
-            <aside class="sidebar">
-                <h2>Statistics</h2>
-                <div class="stats-grid">
-                    <div class="stat-box">
-                        <div class="stat-value" id="stat-points">-</div>
-                        <div class="stat-label">Map Points</div>
-                    </div>
-                    <div class="stat-box">
-                        <div class="stat-value" id="stat-clusters">-</div>
-                        <div class="stat-label">Topics</div>
-                    </div>
-                    <div class="stat-box">
-                        <div class="stat-value" id="stat-quality">-</div>
-                        <div class="stat-label">Avg Quality</div>
-                    </div>
-                    <div class="stat-box">
-                        <div class="stat-value" id="stat-docs">-</div>
-                        <div class="stat-label">In Database</div>
-                    </div>
-                </div>
-                
-                <h2>Filters</h2>
-                <div class="filter-group">
-                    <label>Content Type</label>
-                    <select id="filter-type">
-                        <option value="">All Types</option>
-                        <option value="technical_code">Technical/Code</option>
-                        <option value="scientific">Scientific</option>
-                        <option value="news">News</option>
-                        <option value="blog">Blog/Essay</option>
-                    </select>
-                </div>
-                <div class="filter-group">
-                    <label>Min Quality Score: <span id="quality-value">0%</span></label>
-                    <input type="range" id="filter-quality" min="0" max="100" value="0">
-                </div>
-                
-                <h2>
-                    <span class="toggle-icon" id="hierarchy-toggle">▼</span>
-                    Topic Hierarchy
-                </h2>
-                <ul class="hierarchy-tree" id="hierarchy-tree">
-                    <li class="hierarchy-parent">Loading...</li>
-                </ul>
-                
-                <div class="relationships-section" id="relationships-section" style="display:none;">
-                    <h2>Related Topics</h2>
-                    <div id="relationships-list"></div>
-                </div>
-            </aside>
-            
-            <main class="main-panel">
-                <div class="tab-bar">
-                    <button class="tab active" data-view="map">Map View</button>
-                    <button class="tab" data-view="list">List View</button>
-                </div>
-                
-                <div id="map-container">
-                    <canvas id="map-canvas"></canvas>
-                    <div class="zoom-info" id="zoom-info">Scroll to zoom, drag to pan</div>
-                    
-                    <div class="cluster-info-panel" id="cluster-info-panel">
-                        <h3 id="cluster-info-title">Cluster</h3>
-                        <div class="keywords" id="cluster-info-keywords"></div>
-                        <div class="meta" id="cluster-info-meta"></div>
-                    </div>
-                    
-                    <div class="map-controls">
-                        <button class="map-btn" id="toggle-lines" title="Toggle Connections" style="font-size:12px">⟟</button>
-                        <button class="map-btn" id="zoom-in" title="Zoom In">+</button>
-                        <button class="map-btn" id="zoom-out" title="Zoom Out">−</button>
-                        <button class="map-btn" id="reset-view" title="Reset View">⟲</button>
-                    </div>
-                </div>
-                
-                <div id="list-view">
-                    <ul class="document-list" id="document-list"></ul>
-                </div>
-            </main>
+<div class="app">
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <span class="sidebar-title">Truth Atlas</span>
+            <button class="sidebar-toggle" id="sidebar-toggle" title="Toggle Sidebar">&#9776;</button>
         </div>
-    </div>
-    <div class="tooltip" id="tooltip"></div>
-    
-    <script>
-        const API_BASE = '/api';
-        let allMappings = [];
-        let filteredMappings = [];
-        let documentsData = [];
-        let semanticClusters = {};  // cluster_id -> {label, keywords, ...}
-        let clusterHierarchy = [];  // [{id, label, children: [...]}]
-        let clusterRelationships = [];
-        
-        // Cache for preview excerpts
-        const previewCache = new Map();
-        const pendingPreviews = new Set();
-        
-        // Canvas state for pan/zoom
-        let canvas, ctx;
-        let scale = 1, offsetX = 0, offsetY = 0;
-        let isDragging = false, lastX = 0, lastY = 0;
-        let minQuality = 0, selectedType = '';
-        let activeClusterId = null;
-        
-        // Pre-computed coordinate bounds
-        let globalBounds = { minX: 0, maxX: 1, minY: 0, maxY: 1 };
-        
-        // Render optimization
-        let renderPending = false;
-        let isInteracting = false;
-        let interactionTimeout = null;
-        
-        // Colors for clusters - map cluster_id to consistent color
-        const clusterColorMap = new Map();
-        const baseColors = [
-            '#00ffcc', '#ff6b6b', '#ffd93d', '#ff9f43', '#00ff88',
-            '#ff79c6', '#f1fa8c', '#8be9fd', '#ffb86c', '#50fa7b',
-            '#ff5555', '#bd93f9', '#f8f8f2', '#ffcc00', '#00e5ff',
-        ];
-        
-        function getClusterColor(id) {
-            if (id === -1) return '#888';
-            if (!clusterColorMap.has(id)) {
-                clusterColorMap.set(id, baseColors[clusterColorMap.size % baseColors.length]);
-            }
-            return clusterColorMap.get(id);
-        }
-        
-        function getClusterLabel(clusterId) {
-            if (clusterId === -1) return 'Uncategorized';
-            const cluster = semanticClusters[clusterId];
-            return cluster?.label || `Cluster ${clusterId}`;
-        }
-        
-        // Load stats
-        async function loadStats() {
-            try {
-                const res = await fetch(`${API_BASE}/stats`);
-                const data = await res.json();
-                document.getElementById('stat-docs').textContent = 
-                    data.total_documents?.toLocaleString() || '0';
-            } catch (e) { console.error('Stats error:', e); }
-        }
-        
-        // Load semantic clusters
-        async function loadSemanticClusters() {
-            try {
-                const res = await fetch(`${API_BASE}/semantic-clusters`);
-                const data = await res.json();
-                semanticClusters = data.clusters || {};
-                
-                // Also load hierarchy
-                const hierRes = await fetch(`${API_BASE}/cluster-hierarchy`);
-                const hierData = await hierRes.json();
-                clusterHierarchy = hierData.hierarchy || [];
-                
-                // Load relationships
-                const relRes = await fetch(`${API_BASE}/cluster-relationships`);
-                const relData = await relRes.json();
-                clusterRelationships = relData.relationships || [];
-                
-                renderHierarchyTree();
-            } catch (e) {
-                console.error('Semantic clusters error:', e);
-                // Fall back to basic clusters
-                loadBasicClusters();
-            }
-        }
-        
-        async function loadBasicClusters() {
-            try {
-                const res = await fetch(`${API_BASE}/clusters`);
-                const data = await res.json();
-                const clusters = data.clusters || [];
-                
-                // Convert to semantic format
-                clusters.forEach(c => {
-                    semanticClusters[c.cluster_id] = {
-                        cluster_id: c.cluster_id,
-                        label: c.label || (c.cluster_id === -1 ? 'Uncategorized' : `Cluster ${c.cluster_id}`),
-                        keywords: c.keywords || [],
-                        size: c.doc_count,
-                        avg_quality: c.avg_quality
-                    };
-                });
-                
-                renderHierarchyTree();
-            } catch (e) { console.error('Clusters error:', e); }
-        }
-        
-        function renderHierarchyTree() {
-            const tree = document.getElementById('hierarchy-tree');
-            tree.innerHTML = '';
-            
-            // If we have hierarchy data, render tree
-            if (clusterHierarchy.length > 0) {
-                clusterHierarchy.forEach(parent => {
-                    const li = document.createElement('li');
-                    li.className = 'hierarchy-parent';
-                    li.innerHTML = `
-                        <div class="hierarchy-label" data-cluster-id="${parent.id}">
-                            <div class="label-text">
-                                <span class="label-name" style="color: ${getClusterColor(parent.id)}">${parent.label}</span>
-                                <span class="label-keywords">${(parent.keywords || []).slice(0, 3).join(', ')}</span>
-                            </div>
-                            <span class="label-count">${parent.size} docs</span>
-                        </div>
-                        <ul class="hierarchy-children" id="children-${parent.id}"></ul>
-                    `;
-                    tree.appendChild(li);
-                    
-                    // Add children
-                    const childrenList = document.getElementById(`children-${parent.id}`);
-                    (parent.children || []).forEach(child => {
-                        const childLi = document.createElement('li');
-                        childLi.className = 'hierarchy-child';
-                        childLi.dataset.clusterId = child.id;
-                        childLi.innerHTML = `
-                            <span style="color: ${getClusterColor(child.id)}">${child.label}</span>
-                            <span style="color: #888">${child.size}</span>
-                        `;
-                        childLi.onclick = () => filterByCluster(child.id);
-                        childrenList.appendChild(childLi);
-                    });
-                    
-                    // Make parent clickable to show all its children
-                    li.querySelector('.hierarchy-label').onclick = () => {
-                        const childIds = (parent.children || []).map(c => c.id);
-                        filterByClusterGroup(parent.id, childIds);
-                    };
-                });
-            } else {
-                // Flat list of clusters
-                const sorted = Object.values(semanticClusters)
-                    .sort((a, b) => (b.size || 0) - (a.size || 0));
-                
-                sorted.forEach(c => {
-                    const li = document.createElement('li');
-                    li.className = 'hierarchy-parent';
-                    li.innerHTML = `
-                        <div class="hierarchy-label" data-cluster-id="${c.cluster_id}">
-                            <div class="label-text">
-                                <span class="label-name" style="color: ${getClusterColor(c.cluster_id)}">${c.label}</span>
-                                <span class="label-keywords">${(c.keywords || []).slice(0, 3).join(', ')}</span>
-                            </div>
-                            <span class="label-count">${c.size || 0} docs</span>
-                        </div>
-                    `;
-                    li.querySelector('.hierarchy-label').onclick = () => filterByCluster(c.cluster_id);
-                    tree.appendChild(li);
-                });
-            }
-            
-            // Update stats
-            const nonOrphanedCount = Object.values(semanticClusters).filter(c => c.cluster_id !== -1).length;
-            document.getElementById('stat-clusters').textContent = nonOrphanedCount;
-        }
-        
-        function filterByCluster(clusterId) {
-            if (activeClusterId === clusterId) {
-                // Deselect
-                activeClusterId = null;
-                document.querySelectorAll('.hierarchy-label, .hierarchy-child').forEach(el => 
-                    el.classList.remove('active'));
-                applyFilters(null);
-                hideClusterInfo();
-                hideRelationships();
-            } else {
-                activeClusterId = clusterId;
-                document.querySelectorAll('.hierarchy-label, .hierarchy-child').forEach(el => {
-                    const elId = parseInt(el.dataset.clusterId);
-                    el.classList.toggle('active', elId === clusterId);
-                });
-                applyFilters(clusterId);
-                showClusterInfo(clusterId);
-                showRelationships(clusterId);
-                loadClusterDocuments(clusterId);
-            }
-        }
-        
-        function filterByClusterGroup(parentId, childIds) {
-            activeClusterId = parentId;
-            document.querySelectorAll('.hierarchy-label').forEach(el => {
-                const elId = parseInt(el.dataset.clusterId);
-                el.classList.toggle('active', elId === parentId);
-            });
-            
-            // Filter to show all children
-            filteredMappings = allMappings.filter(m => {
-                if (minQuality > 0 && (m.quality_score || 0) < minQuality) return false;
-                if (selectedType && m.content_type !== selectedType) return false;
-                return childIds.includes(m.cluster_id);
-            });
-            renderCanvas();
-            showClusterInfo(parentId);
-        }
-        
-        function showClusterInfo(clusterId) {
-            const panel = document.getElementById('cluster-info-panel');
-            const cluster = semanticClusters[clusterId];
-            
-            if (!cluster) {
-                panel.classList.remove('visible');
-                return;
-            }
-            
-            document.getElementById('cluster-info-title').textContent = cluster.label;
-            document.getElementById('cluster-info-title').style.color = getClusterColor(clusterId);
-            
-            const keywordsEl = document.getElementById('cluster-info-keywords');
-            keywordsEl.innerHTML = (cluster.keywords || []).slice(0, 5).map(kw => 
-                `<span class="keyword-tag">${kw}</span>`
-            ).join('');
-            
-            const metaEl = document.getElementById('cluster-info-meta');
-            metaEl.innerHTML = `
-                ${cluster.size || 0} documents · 
-                Avg quality: ${((cluster.avg_quality || 0) * 100).toFixed(0)}%
-                ${cluster.description ? `<br><em>${cluster.description}</em>` : ''}
-            `;
-            
-            panel.classList.add('visible');
-        }
-        
-        function hideClusterInfo() {
-            document.getElementById('cluster-info-panel').classList.remove('visible');
-        }
-        
-        function showRelationships(clusterId) {
-            const section = document.getElementById('relationships-section');
-            const list = document.getElementById('relationships-list');
-            
-            const related = clusterRelationships.filter(r => 
-                r.source_id === clusterId || r.target_id === clusterId
-            ).slice(0, 5);
-            
-            if (related.length === 0) {
-                section.style.display = 'none';
-                return;
-            }
-            
-            list.innerHTML = related.map(r => {
-                const otherLabel = r.source_id === clusterId ? r.target_label : r.source_label;
-                const otherId = r.source_id === clusterId ? r.target_id : r.source_id;
-                return `
-                    <div class="relationship-item" onclick="filterByCluster(${otherId})">
-                        <span class="rel-type ${r.relationship_type}">${r.relationship_type}</span>
-                        <span style="color: ${getClusterColor(otherId)}">${otherLabel}</span>
-                        <span style="color: #666">${(r.similarity * 100).toFixed(0)}%</span>
-                    </div>
-                `;
-            }).join('');
-            
-            section.style.display = 'block';
-        }
-        
-        function hideRelationships() {
-            document.getElementById('relationships-section').style.display = 'none';
-        }
-        
-        async function loadClusterDocuments(clusterId) {
-            try {
-                const res = await fetch(`${API_BASE}/clusters/${clusterId}`);
-                const data = await res.json();
-                documentsData = data.documents || [];
-                renderDocumentList();
-            } catch(e) { console.error('Cluster docs error:', e); }
-        }
-        
-        // Load mappings with semantic data
-        async function loadMappings() {
-            try {
-                const res = await fetch(`${API_BASE}/mappings`);
-                const data = await res.json();
-                allMappings = data.mappings || [];
-                
-                // Extract semantic clusters from mappings if available
-                if (data.clusters) {
-                    semanticClusters = data.clusters;
-                }
-                
-                // Enrich with document data
-                const docsRes = await fetch(`${API_BASE}/documents?limit=1000`);
-                const docsData = await docsRes.json();
-                const docsMap = {};
-                (docsData.documents || []).forEach(d => { docsMap[d.id] = d; });
-                
-                allMappings.forEach(m => {
-                    const doc = docsMap[m.doc_id];
-                    if (doc) {
-                        m.title = doc.title;
-                        m.url = doc.url;
-                        m.domain = doc.domain;
-                        m.content_type = doc.content_type;
-                        if (doc.summary) {
-                            m.excerpt = doc.summary;
-                            previewCache.set(m.doc_id, doc.summary);
-                        }
-                    }
-                    
-                    // Use semantic cluster label if available
-                    if (!m.cluster_label && semanticClusters[m.cluster_id]) {
-                        m.cluster_label = semanticClusters[m.cluster_id].label;
-                        m.cluster_keywords = semanticClusters[m.cluster_id].keywords;
-                    }
-                });
-                
-                filteredMappings = [...allMappings];
-                
-                // Compute global bounds
-                if (allMappings.length) {
-                    const xs = allMappings.map(m => m.x);
-                    const ys = allMappings.map(m => m.y);
-                    globalBounds = {
-                        minX: Math.min(...xs),
-                        maxX: Math.max(...xs),
-                        minY: Math.min(...ys),
-                        maxY: Math.max(...ys)
-                    };
-                }
-                
-                updateStatsFromMappings();
-                initCanvas();
-                renderCanvas();
-            } catch (e) {
-                console.error('Mappings error:', e);
-            }
-        }
-        
-        function updateStatsFromMappings() {
-            document.getElementById('stat-points').textContent = allMappings.length.toLocaleString();
-            if (allMappings.length) {
-                const avgQ = allMappings.reduce((s,m) => s + (m.quality_score||0), 0) / allMappings.length;
-                document.getElementById('stat-quality').textContent = (avgQ * 100).toFixed(0) + '%';
-            }
-        }
-        
-        function applyFilters(clusterId = null) {
-            filteredMappings = allMappings.filter(m => {
-                if (minQuality > 0 && (m.quality_score || 0) < minQuality) return false;
-                if (selectedType && m.content_type !== selectedType) return false;
-                if (clusterId !== null && m.cluster_id !== clusterId) return false;
-                return true;
-            });
-            renderCanvas();
-        }
-        
-        // Canvas rendering
-        function initCanvas() {
-            canvas = document.getElementById('map-canvas');
-            ctx = canvas.getContext('2d');
-            resizeCanvas();
-            window.addEventListener('resize', () => { resizeCanvas(); renderCanvas(); });
-            
-            // Mouse events for pan
-            canvas.addEventListener('mousedown', e => {
-                isDragging = true;
-                lastX = e.clientX; lastY = e.clientY;
-                canvas.style.cursor = 'grabbing';
-                startInteraction();
-            });
-            canvas.addEventListener('mousemove', e => {
-                if (isDragging) {
-                    offsetX += e.clientX - lastX;
-                    offsetY += e.clientY - lastY;
-                    lastX = e.clientX; lastY = e.clientY;
-                    renderCanvas();
-                } else {
-                    handleHover(e);
-                }
-            });
-            canvas.addEventListener('mouseup', () => { 
-                isDragging = false; 
-                canvas.style.cursor = 'grab'; 
-                endInteraction();
-            });
-            canvas.addEventListener('mouseleave', () => { 
-                isDragging = false; 
-                hideTooltip(); 
-                endInteraction();
-            });
-            
-            // Scroll zoom
-            canvas.addEventListener('wheel', e => {
-                e.preventDefault();
-                startInteraction();
-                const rect = canvas.getBoundingClientRect();
-                const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-                const zoomFactor = e.deltaY > 0 ? 0.92 : 1.08;
-                const newScale = Math.max(0.1, Math.min(100, scale * zoomFactor));
-                offsetX = mx - (mx - offsetX) * (newScale / scale);
-                offsetY = my - (my - offsetY) * (newScale / scale);
-                scale = newScale;
-                renderCanvas();
-                endInteraction();
-            }, { passive: false });
-            
-            // Click to open URL
-            canvas.addEventListener('click', e => {
-                const hit = getPointAtPos(e);
-                if (hit && hit.url) window.open(hit.url, '_blank');
-            });
-            
-            // Buttons
-            document.getElementById('zoom-in').onclick = () => { 
-                startInteraction();
-                const cx = canvas.width / 2, cy = canvas.height / 2;
-                const newScale = Math.min(100, scale * 1.3);
-                offsetX = cx - (cx - offsetX) * (newScale / scale);
-                offsetY = cy - (cy - offsetY) * (newScale / scale);
-                scale = newScale;
-                renderCanvas(); 
-                endInteraction();
-            };
-            document.getElementById('zoom-out').onclick = () => { 
-                startInteraction();
-                const cx = canvas.width / 2, cy = canvas.height / 2;
-                const newScale = Math.max(0.1, scale * 0.7);
-                offsetX = cx - (cx - offsetX) * (newScale / scale);
-                offsetY = cy - (cy - offsetY) * (newScale / scale);
-                scale = newScale;
-                renderCanvas(); 
-                endInteraction();
-            };
-            document.getElementById('reset-view').onclick = () => { 
-                scale = 1; offsetX = 0; offsetY = 0; 
-                renderCanvas(); 
-            };
-            document.getElementById('toggle-lines').onclick = () => { 
-                showConnections = !showConnections; 
-                document.getElementById('toggle-lines').style.background = showConnections ? '#00d4ff33' : '#16213e';
-                renderCanvas(); 
-            };
-        }
-        
-        function resizeCanvas() {
-            const container = document.getElementById('map-container');
-            canvas.width = container.clientWidth;
-            canvas.height = container.clientHeight;
-        }
-        
-        function getPointAtPos(e) {
-            const rect = canvas.getBoundingClientRect();
-            const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-            if (!filteredMappings.length) return null;
-            
-            const { minX, maxX, minY, maxY } = globalBounds;
-            const padding = 50;
-            const rangeX = maxX - minX || 1;
-            const rangeY = maxY - minY || 1;
-            const drawWidth = canvas.width - 2 * padding;
-            const drawHeight = canvas.height - 2 * padding;
-            
-            for (const m of filteredMappings) {
-                const x = padding + ((m.x - minX) / rangeX) * drawWidth;
-                const y = padding + ((m.y - minY) / rangeY) * drawHeight;
-                const sx = x * scale + offsetX;
-                const sy = y * scale + offsetY;
-                const r = (2 + (m.z || 0.5) * 3) * scale;
-                const dist = Math.sqrt((mx - sx)**2 + (my - sy)**2);
-                if (dist <= r + 5) return m;
-            }
-            return null;
-        }
-        
-        function handleHover(e) {
-            const m = getPointAtPos(e);
-            if (m) {
-                showTooltip(e, m);
-                canvas.style.cursor = 'pointer';
-            } else {
-                hideTooltip();
-                canvas.style.cursor = isDragging ? 'grabbing' : 'grab';
-            }
-        }
-        
-        let showConnections = true;
-        
-        function startInteraction() {
-            isInteracting = true;
-            if (interactionTimeout) clearTimeout(interactionTimeout);
-        }
-        
-        function endInteraction() {
-            if (interactionTimeout) clearTimeout(interactionTimeout);
-            interactionTimeout = setTimeout(() => {
-                isInteracting = false;
-                renderCanvas();
-            }, 150);
-        }
-        
-        function requestRender() {
-            if (renderPending) return;
-            renderPending = true;
-            requestAnimationFrame(() => {
-                renderPending = false;
-                _renderCanvasImpl();
-            });
-        }
-        
-        function updateZoomInfo() {
-            const zoomPercent = Math.round(scale * 100);
-            document.getElementById('zoom-info').textContent = `Zoom: ${zoomPercent}% | Drag to pan`;
-        }
-        
-        function renderCanvas() {
-            updateZoomInfo();
-            requestRender();
-        }
-        
-        function _renderCanvasImpl() {
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            if (!filteredMappings.length && !allMappings.length) {
-                ctx.fillStyle = '#666';
-                ctx.font = '14px sans-serif';
-                ctx.textAlign = 'center';
-                ctx.fillText('No data matching filters', canvas.width/2, canvas.height/2);
-                return;
-            }
-            
-            const { minX, maxX, minY, maxY } = globalBounds;
-            const padding = 50;
-            const rangeX = maxX - minX || 1;
-            const rangeY = maxY - minY || 1;
-            const drawWidth = canvas.width - 2 * padding;
-            const drawHeight = canvas.height - 2 * padding;
-            
-            const positions = filteredMappings.map(m => {
-                const x = padding + ((m.x - minX) / rangeX) * drawWidth;
-                const y = padding + ((m.y - minY) / rangeY) * drawHeight;
-                return { sx: x * scale + offsetX, sy: y * scale + offsetY, m };
-            });
-            
-            // Culling
-            const margin = 100;
-            const visiblePositions = positions.filter(p => 
-                p.sx >= -margin && p.sx <= canvas.width + margin &&
-                p.sy >= -margin && p.sy <= canvas.height + margin
-            );
-            
-            // Simplified rendering during interaction
-            if (isInteracting) {
-                ctx.globalAlpha = 0.7;
-                const colorGroups = {};
-                visiblePositions.forEach(p => {
-                    const color = getClusterColor(p.m.cluster_id ?? -1);
-                    if (!colorGroups[color]) colorGroups[color] = [];
-                    colorGroups[color].push(p);
-                });
-                
-                const fixedRadius = Math.max(2, 3 * scale);
-                Object.entries(colorGroups).forEach(([color, pts]) => {
-                    ctx.fillStyle = color;
-                    ctx.beginPath();
-                    pts.forEach(({ sx, sy }) => {
-                        ctx.moveTo(sx + fixedRadius, sy);
-                        ctx.arc(sx, sy, fixedRadius, 0, Math.PI * 2);
-                    });
-                    ctx.fill();
-                });
-                ctx.globalAlpha = 1;
-                return;
-            }
-            
-            // Full quality render
-            if (showConnections && scale > 0.5 && visiblePositions.length < 1500) {
-                ctx.globalAlpha = 0.4;
-                ctx.lineWidth = 0.8 * scale;
-                ctx.strokeStyle = '#ffffff';
-                
-                const clusterGroups = {};
-                visiblePositions.forEach((p, i) => {
-                    const cid = p.m.cluster_id ?? -1;
-                    if (cid === -1) return;
-                    if (!clusterGroups[cid]) clusterGroups[cid] = [];
-                    clusterGroups[cid].push({ ...p, idx: i });
-                });
-                
-                ctx.beginPath();
-                Object.values(clusterGroups).forEach(points => {
-                    if (points.length < 2) return;
-                    points.sort((a, b) => a.sx - b.sx || a.sy - b.sy);
-                    for (let i = 0; i < points.length - 1; i++) {
-                        const p1 = points[i], p2 = points[i + 1];
-                        const dist = Math.hypot(p1.sx - p2.sx, p1.sy - p2.sy);
-                        if (dist < 100 * scale) {
-                            ctx.moveTo(p1.sx, p1.sy);
-                            ctx.lineTo(p2.sx, p2.sy);
-                        }
-                    }
-                });
-                ctx.stroke();
-                ctx.globalAlpha = 1;
-            }
-            
-            // Draw points
-            const colorGroups = {};
-            visiblePositions.forEach(p => {
-                const color = getClusterColor(p.m.cluster_id ?? -1);
-                if (!colorGroups[color]) colorGroups[color] = [];
-                colorGroups[color].push(p);
-            });
-            
-            ctx.globalAlpha = 0.8;
-            Object.entries(colorGroups).forEach(([color, pts]) => {
-                ctx.fillStyle = color;
-                ctx.beginPath();
-                pts.forEach(({ sx, sy, m }) => {
-                    const r = (2 + (m.z || 0.5) * 3) * scale;
-                    ctx.moveTo(sx + r, sy);
-                    ctx.arc(sx, sy, r, 0, Math.PI * 2);
-                });
-                ctx.fill();
-            });
-            ctx.globalAlpha = 1;
-        }
-        
-        function showTooltip(e, m) {
-            const tooltip = document.getElementById('tooltip');
-            tooltip.style.display = 'block';
-            
-            let left = e.clientX + 15;
-            let top = e.clientY + 15;
-            if (left + 400 > window.innerWidth) left = e.clientX - 410;
-            if (top + 200 > window.innerHeight) top = e.clientY - 210;
-            tooltip.style.left = left + 'px';
-            tooltip.style.top = top + 'px';
-            
-            const title = m.title || m.url?.split('/').pop() || `Point ${m.doc_id?.substring(0,8)}`;
-            const domain = m.domain || (m.url ? new URL(m.url).hostname : '');
-            const docId = m.doc_id;
-            const clusterLabel = m.cluster_label || getClusterLabel(m.cluster_id);
-            
-            // Build hierarchy path
-            let pathHtml = '';
-            if (m.hierarchy_path && m.hierarchy_path.length > 0) {
-                pathHtml = `<div class="tooltip-path">${m.hierarchy_path.map(p => 
-                    `<span>${p}</span>`).join(' › ')}</div>`;
-            }
-            
-            // Excerpt
-            let excerptHtml = '';
-            if (previewCache.has(docId)) {
-                const excerpt = previewCache.get(docId);
-                if (excerpt) {
-                    excerptHtml = `<div class="tooltip-excerpt">"${excerpt.substring(0, 150)}${excerpt.length > 150 ? '...' : ''}"</div>`;
-                }
-            } else if (m.excerpt) {
-                excerptHtml = `<div class="tooltip-excerpt">"${m.excerpt.substring(0, 150)}${m.excerpt.length > 150 ? '...' : ''}"</div>`;
-                previewCache.set(docId, m.excerpt);
-            } else if (docId) {
-                excerptHtml = `<div class="tooltip-excerpt" id="preview-${docId}" style="color:#666;font-style:italic">Loading preview...</div>`;
-                fetchPreviewAsync(docId);
-            }
-            
-            tooltip.innerHTML = `
-                <div class="tooltip-title">${title}</div>
-                <span class="tooltip-cluster" style="background: ${getClusterColor(m.cluster_id)}33; color: ${getClusterColor(m.cluster_id)}">${clusterLabel}</span>
-                ${pathHtml}
-                ${excerptHtml}
-                <div class="tooltip-meta">
-                    ${domain ? `<span style="color:#00d4ff">${domain}</span><br>` : ''}
-                    Quality: ${((m.quality_score||0) * 100).toFixed(0)}% · 
-                    Importance: ${((m.z||0.5) * 100).toFixed(0)}%
-                    ${m.url ? '<br><span style="color:#888;font-size:9px">Click to open website</span>' : ''}
+        <div class="sidebar-content">
+            <div class="view-tabs">
+                <button class="tab active" data-view="map">Map View</button>
+                <button class="tab" data-view="list">List View</button>
+            </div>
+
+            <h2>Statistics</h2>
+            <div class="stats-grid">
+                <div class="stat-box">
+                    <div class="stat-value" id="stat-points">-</div>
+                    <div class="stat-label">Map Points</div>
                 </div>
-            `;
-        }
-        
-        async function fetchPreviewAsync(docId) {
-            if (pendingPreviews.has(docId) || previewCache.has(docId)) return;
-            pendingPreviews.add(docId);
-            
-            try {
-                const res = await fetch(`${API_BASE}/preview/${docId}`);
-                const data = await res.json();
-                
-                if (data.excerpt) {
-                    previewCache.set(docId, data.excerpt);
-                    const mapping = allMappings.find(m => m.doc_id === docId);
-                    if (mapping) mapping.excerpt = data.excerpt;
-                    
-                    const previewEl = document.getElementById(`preview-${docId}`);
-                    if (previewEl) {
-                        previewEl.style.color = '#aaa';
-                        previewEl.textContent = `"${data.excerpt.substring(0, 150)}${data.excerpt.length > 150 ? '...' : ''}"`;
-                    }
-                } else {
-                    previewCache.set(docId, null);
-                    const previewEl = document.getElementById(`preview-${docId}`);
-                    if (previewEl) previewEl.textContent = 'Preview not available';
-                }
-            } catch (e) {
-                previewCache.set(docId, null);
-            } finally {
-                pendingPreviews.delete(docId);
+                <div class="stat-box">
+                    <div class="stat-value" id="stat-clusters">-</div>
+                    <div class="stat-label">Clusters</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="stat-quality">-</div>
+                    <div class="stat-label">Avg Quality</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="stat-docs">-</div>
+                    <div class="stat-label">In Database</div>
+                </div>
+            </div>
+
+            <h2>Mapping</h2>
+            <div class="filter-group">
+                <label>Active Dataset</label>
+                <select id="mapping-select"><option value="">Latest</option></select>
+            </div>
+
+            <h2>Filters</h2>
+            <div class="filter-group">
+                <label>Content Type</label>
+                <select id="filter-type">
+                    <option value="">All Types</option>
+                    <option value="technical_code">Technical/Code</option>
+                    <option value="scientific">Scientific</option>
+                    <option value="news">News</option>
+                    <option value="blog">Blog/Essay</option>
+                </select>
+            </div>
+            <div class="filter-group">
+                <label>Min Quality: <span id="quality-value">0%</span></label>
+                <input type="range" id="filter-quality" min="0" max="100" value="0">
+            </div>
+
+            <h2>Search</h2>
+            <div class="filter-group">
+                <label>Results Limit: <span id="search-limit-value">20</span></label>
+                <input type="range" id="search-limit" min="5" max="100" value="20" step="5">
+            </div>
+
+            <h2>Clusters</h2>
+            <ul class="cluster-list" id="cluster-list">
+                <li class="cluster-item">Loading...</li>
+            </ul>
+        </div>
+    </aside>
+
+    <main class="main-panel">
+        <div id="deck-container">
+            <div class="load-overlay" id="load-overlay">
+                <div class="spinner"></div>
+                <div class="load-text">Loading atlas data...</div>
+            </div>
+            <div class="search-panel" id="search-panel">
+                <div class="search-bar" id="search-bar">
+                    <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                    </svg>
+                    <input type="text" id="search-input" placeholder="Search documents..." autocomplete="off" spellcheck="false">
+                    <button class="search-clear" id="search-clear" title="Clear search">&times;</button>
+                </div>
+                <div class="search-meta" id="search-meta"></div>
+                <div class="search-results" id="search-results"></div>
+            </div>
+            <div class="zoom-info" id="zoom-info">Scroll to zoom, drag to pan</div>
+            <div class="map-controls">
+                <button class="map-btn" id="toggle-lines" title="Toggle Connections" style="font-size:12px">&#10207;</button>
+                <button class="map-btn" id="zoom-in" title="Zoom In">+</button>
+                <button class="map-btn" id="zoom-out" title="Zoom Out">&minus;</button>
+                <button class="map-btn" id="reset-view" title="Reset View">&#10226;</button>
+            </div>
+        </div>
+
+        <div id="list-view">
+            <ul class="document-list" id="document-list"></ul>
+        </div>
+    </main>
+</div>
+
+<script>
+/* ===== State ===== */
+const API = '/api';
+let allMappings = [];
+let filteredMappings = [];
+let deckgl = null;
+let currentViewState = null;
+let initialViewState = null;
+let showConnections = true;
+let activeClusterId = null;
+let minQuality = 0;
+let selectedType = '';
+
+/* Search state */
+let matchedIds = null;       // null = no active search; Set<string> = active search
+let searchResultsLimit = 20;
+let searchDebounceTimer = null;
+
+/* ===== Colors ===== */
+const COLORS = [
+    [0,255,204],[255,107,107],[255,217,61],[255,159,67],[0,255,136],
+    [255,121,198],[139,233,253],[255,184,108],[80,250,123],[189,147,249],
+    [0,212,255],[255,85,85],[248,248,242],[255,204,0],[0,229,255],
+];
+const colorMap = new Map();
+
+function clusterRgb(id) {
+    if (id == null || id === -1) return [136,136,136];
+    if (!colorMap.has(id)) colorMap.set(id, COLORS[colorMap.size % COLORS.length]);
+    return colorMap.get(id);
+}
+function clusterHex(id) {
+    return '#' + clusterRgb(id).map(v => v.toString(16).padStart(2,'0')).join('');
+}
+
+/* ===== deck.gl ===== */
+function fitView(data) {
+    if (!data.length) return { target:[0,0,0], zoom:0, minZoom:-5, maxZoom:20 };
+    const xs = data.map(d => d.x), ys = data.map(d => d.y);
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+    const el = document.getElementById('deck-container');
+    const zoom = Math.min(
+        Math.log2((el.clientWidth * 0.85) / (maxX - minX || 1)),
+        Math.log2((el.clientHeight * 0.85) / (maxY - minY || 1))
+    );
+    return { target:[(minX+maxX)/2, (minY+maxY)/2, 0], zoom: Math.max(-5, zoom), minZoom:-5, maxZoom:20 };
+}
+
+function connectionLines(data) {
+    const groups = {};
+    data.forEach(d => { const c = d.cluster_id ?? -1; if (c !== -1) { (groups[c] ||= []).push(d); } });
+    const lines = [];
+    const xs = data.map(d=>d.x), ys = data.map(d=>d.y);
+    const thresh = Math.max((Math.max(...xs)-Math.min(...xs))||1, (Math.max(...ys)-Math.min(...ys))||1) * 0.04;
+    Object.entries(groups).forEach(([cid, pts]) => {
+        if (pts.length < 2) return;
+        pts.sort((a,b) => a.x - b.x || a.y - b.y);
+        for (let i = 0; i < pts.length - 1; i++) {
+            if (Math.hypot(pts[i].x - pts[i+1].x, pts[i].y - pts[i+1].y) < thresh) {
+                lines.push({ source:[pts[i].x,pts[i].y], target:[pts[i+1].x,pts[i+1].y], cluster_id:+cid });
             }
         }
-        
-        function hideTooltip() {
-            document.getElementById('tooltip').style.display = 'none';
-        }
-        
-        async function loadDocuments(params = {}) {
-            const query = new URLSearchParams(params).toString();
-            const res = await fetch(`${API_BASE}/documents?${query}`);
-            const data = await res.json();
-            documentsData = data.documents || [];
-            renderDocumentList();
-        }
-        
-        function renderDocumentList() {
-            const list = document.getElementById('document-list');
-            list.innerHTML = '';
-            
-            documentsData.forEach(doc => {
-                const li = document.createElement('li');
-                li.className = 'document-item';
-                li.style.borderLeftColor = getClusterColor(doc.cluster_id);
-                
-                const quality = doc.quality_score || 0;
-                let badgeClass = quality >= 0.7 ? 'quality-high' : quality >= 0.4 ? 'quality-medium' : 'quality-low';
-                const clusterLabel = getClusterLabel(doc.cluster_id);
-                
-                li.innerHTML = `
-                    <div class="document-title">
-                        <a href="${doc.url}" target="_blank">${doc.title || 'Untitled'}</a>
-                        <span class="quality-badge ${badgeClass}">${(quality * 100).toFixed(0)}%</span>
-                    </div>
-                    <div class="document-meta">
-                        ${doc.domain || ''} · ${doc.content_type || 'unknown'}
-                        <span class="document-cluster">${clusterLabel}</span>
-                    </div>
-                `;
-                list.appendChild(li);
-            });
-        }
-        
-        // Tab switching
-        document.querySelectorAll('.tab').forEach(tab => {
-            tab.onclick = () => {
-                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-                tab.classList.add('active');
-                const view = tab.dataset.view;
-                document.getElementById('map-container').style.display = view === 'map' ? 'block' : 'none';
-                document.getElementById('list-view').style.display = view === 'list' ? 'flex' : 'none';
-                if (view === 'list' && !documentsData.length) loadDocuments({ limit: 50 });
+    });
+    return lines;
+}
+
+function buildLayers(data) {
+    const searchActive = matchedIds !== null;
+    return [
+        new deck.LineLayer({
+            id:'connections', data: connectionLines(data),
+            getSourcePosition: d=>d.source, getTargetPosition: d=>d.target,
+            getColor: d => {
+                const rgb = clusterRgb(d.cluster_id);
+                return searchActive ? [...rgb, 12] : [...rgb, 60];
+            },
+            getWidth:1,
+            visible: showConnections, pickable: false,
+            updateTriggers: { getColor: [searchActive] },
+        }),
+        new deck.ScatterplotLayer({
+            id:'points', data,
+            getPosition: d=>[d.x, d.y],
+            getFillColor: d => {
+                const rgb = clusterRgb(d.cluster_id ?? -1);
+                if (searchActive && !matchedIds.has(d.doc_id)) {
+                    return [...rgb, 0]; // fully transparent non-match
+                }
+                if (searchActive) {
+                    return [0, 255, 136, 230]; // green highlight for matches
+                }
+                return [...rgb, 200]; // default highlight before search
+            },
+            getRadius: d=> {
+                const base = 2 + (d.z||0.5)*3;
+                if (searchActive && matchedIds.has(d.doc_id)) {
+                    return base * 1.35;
+                }
+                return base;
+            },
+            radiusMinPixels:2, radiusMaxPixels:4, radiusUnits:'common',
+            pickable:true, autoHighlight:true, highlightColor:[255,255,255,80],
+            opacity:0.8,
+            updateTriggers: {
+                getFillColor: [searchActive, matchedIds ? matchedIds.size : 0],
+                getRadius: [searchActive, matchedIds ? matchedIds.size : 0],
+            },
+        }),
+    ];
+}
+
+function initDeck(data) {
+    initialViewState = fitView(data);
+    currentViewState = { ...initialViewState };
+    deckgl = new deck.DeckGL({
+        container: 'deck-container',
+        views: new deck.OrthographicView({ controller: true }),
+        initialViewState,
+        layers: buildLayers(data),
+        onViewStateChange: ({viewState}) => {
+            currentViewState = viewState;
+            const pct = Math.round(Math.pow(2, viewState.zoom) * 100);
+            document.getElementById('zoom-info').textContent = `Zoom: ${pct}% | Drag to pan`;
+        },
+        onClick: (info) => {
+            if (!info.object) return;
+            if (matchedIds && !matchedIds.has(info.object.doc_id)) return;
+            if (info.object.url) window.open(info.object.url, '_blank');
+        },
+        getTooltip: ({object: o}) => {
+            if (!o) return null;
+            if (matchedIds && !matchedIds.has(o.doc_id)) return null;
+            const title = o.title || o.url?.split('/').pop() || `Point ${(o.doc_id||'').substring(0,8)}`;
+            const color = clusterHex(o.cluster_id ?? -1);
+            const excerpt = o.excerpt ? o.excerpt.substring(0,140) : '';
+            return {
+                html: `<div style="color:${color};font-weight:bold;margin-bottom:4px">${title}</div>
+                    <div style="display:inline-block;padding:2px 8px;background:${color}33;border-radius:10px;font-size:10px;color:${color};margin-bottom:6px">Cluster ${o.cluster_id ?? 'N/A'}</div>
+                    ${excerpt ? `<div style="color:#ccc;font-size:11px;margin:6px 0;font-style:italic;border-left:2px solid ${color}44;padding-left:8px">"${excerpt}${excerpt.length>=140?'...':''}"</div>` : ''}
+                    <div style="color:#888;font-size:10px">
+                        ${o.domain ? `<span style="color:#00d4ff">${o.domain}</span><br>` : ''}
+                        Quality: ${((o.quality_score||0)*100).toFixed(0)}% &middot; Importance: ${((o.z||0.5)*100).toFixed(0)}%
+                        ${o.url ? '<br><span style="opacity:0.5;font-size:9px">Click to open</span>' : ''}
+                    </div>`,
+                style: {
+                    backgroundColor:'#000000ee', color:'#eee', fontSize:'12px',
+                    borderRadius:'6px', border:'1px solid #333', padding:'12px 14px',
+                    maxWidth:'380px', lineHeight:'1.4', boxShadow:'0 4px 12px rgba(0,0,0,0.4)',
+                },
             };
+        },
+    });
+    document.getElementById('load-overlay').classList.add('hidden');
+}
+
+function updateDeck() { if (deckgl) deckgl.setProps({ layers: buildLayers(filteredMappings) }); }
+
+/* ===== Data Loading ===== */
+async function loadStats() {
+    try {
+        const data = await (await fetch(`${API}/stats`)).json();
+        document.getElementById('stat-docs').textContent = data.total_documents?.toLocaleString() || '0';
+    } catch (e) { console.error('Stats:', e); }
+}
+
+async function loadMappingList() {
+    try {
+        const data = await (await fetch(`${API}/mapping-list`)).json();
+        const sel = document.getElementById('mapping-select');
+        (data.mappings || []).forEach(m => {
+            const opt = document.createElement('option');
+            opt.value = m.id; opt.textContent = m.name || m.id;
+            sel.appendChild(opt);
         });
-        
-        // Filters
-        document.getElementById('filter-type').onchange = (e) => {
-            selectedType = e.target.value;
-            applyFilters(activeClusterId);
-            loadDocuments({ content_type: selectedType, min_quality: minQuality, limit: 50 });
-        };
-        
-        document.getElementById('filter-quality').oninput = (e) => {
-            document.getElementById('quality-value').textContent = e.target.value + '%';
-        };
-        
-        document.getElementById('filter-quality').onchange = (e) => {
-            minQuality = e.target.value / 100;
-            applyFilters(activeClusterId);
-            loadDocuments({ content_type: selectedType, min_quality: minQuality, limit: 50 });
-        };
-        
-        // Initialize
-        async function init() {
-            loadStats();
-            await loadSemanticClusters();
-            await loadMappings();
+    } catch (e) { /* single mapping mode */ }
+}
+
+async function loadMappings(mappingId) {
+    try {
+        let url = `${API}/mappings`;
+        if (mappingId) url += `?mapping_id=${encodeURIComponent(mappingId)}`;
+        const data = await (await fetch(url)).json();
+        allMappings = data.mappings || [];
+
+        // Server-side enrichment handles metadata, but fallback client-side if needed
+        const needsEnrich = allMappings.some(m =>
+            !m.title || !m.url || !m.domain || !m.content_type || !m.excerpt
+        );
+        if (allMappings.length && needsEnrich) {
+            try {
+                const docs = await (await fetch(`${API}/documents?limit=${allMappings.length}`)).json();
+                const map = {}; (docs.documents||[]).forEach(d => { map[d.id] = d; });
+                allMappings.forEach(m => {
+                    const d = map[m.doc_id];
+                    if (d) {
+                        m.title ||= d.title;
+                        m.url ||= d.url;
+                        m.domain ||= d.domain;
+                        m.content_type ||= d.content_type;
+                        m.excerpt ||= d.summary || '';
+                    }
+                });
+            } catch (e) { console.warn('Enrichment fallback failed:', e); }
         }
-        init();
-    </script>
+
+        filteredMappings = [...allMappings];
+        updateStats();
+        updateClusterList();
+
+        if (!deckgl) { initDeck(filteredMappings); }
+        else {
+            initialViewState = fitView(filteredMappings);
+            deckgl.setProps({ initialViewState: { ...initialViewState, transitionDuration:400 }, layers: buildLayers(filteredMappings) });
+        }
+    } catch (e) {
+        console.error('Mappings:', e);
+        document.getElementById('load-overlay').innerHTML = '<div class="load-text" style="color:#ff6b6b">Failed to load mapping data</div>';
+    }
+}
+
+function updateStats() {
+    document.getElementById('stat-points').textContent = allMappings.length.toLocaleString();
+    if (allMappings.length) {
+        const avg = allMappings.reduce((s,m) => s + (m.quality_score||0), 0) / allMappings.length;
+        document.getElementById('stat-quality').textContent = (avg*100).toFixed(0) + '%';
+    }
+}
+
+function updateClusterList() {
+    const stats = {};
+    allMappings.forEach(m => {
+        const c = m.cluster_id ?? -1;
+        if (!stats[c]) stats[c] = { count:0, qsum:0 };
+        stats[c].count++; stats[c].qsum += (m.quality_score||0);
+    });
+
+    const sorted = Object.entries(stats)
+        .map(([id,s]) => ({ id:+id, count:s.count, avg:s.qsum/s.count }))
+        .sort((a,b) => b.count - a.count);
+
+    document.getElementById('stat-clusters').textContent = sorted.filter(c => c.id !== -1).length;
+
+    const list = document.getElementById('cluster-list');
+    list.innerHTML = '';
+    sorted.forEach(c => {
+        const li = document.createElement('li');
+        li.className = 'cluster-item';
+        li.dataset.cid = c.id;
+        li.innerHTML = `<span style="color:${clusterHex(c.id)}">${c.id === -1 ? 'Orphaned' : 'Cluster '+c.id}</span><span class="cluster-count">${c.count} docs</span>`;
+        li.onclick = () => toggleCluster(c.id);
+        list.appendChild(li);
+    });
+}
+
+/* ===== Filtering ===== */
+function toggleCluster(id) {
+    if (activeClusterId === id) { activeClusterId = null; }
+    else { activeClusterId = id; }
+    document.querySelectorAll('.cluster-item').forEach(el => {
+        el.classList.toggle('active', +el.dataset.cid === activeClusterId);
+    });
+    applyFilters();
+}
+
+function applyFilters() {
+    filteredMappings = allMappings.filter(m => {
+        if (minQuality > 0 && (m.quality_score||0) < minQuality) return false;
+        if (selectedType && m.content_type !== selectedType) return false;
+        if (activeClusterId !== null && (m.cluster_id ?? -1) !== activeClusterId) return false;
+        return true;
+    });
+    updateDeck();
+}
+
+/* ===== Document List ===== */
+async function loadDocuments(params = {}) {
+    const data = await (await fetch(`${API}/documents?${new URLSearchParams(params)}`)).json();
+    renderDocList(data.documents || []);
+}
+
+function renderDocList(docs) {
+    const list = document.getElementById('document-list');
+    list.innerHTML = '';
+    docs.forEach(doc => {
+        const q = doc.quality_score || 0;
+        const badge = q >= 0.7 ? 'quality-high' : q >= 0.4 ? 'quality-medium' : 'quality-low';
+        const li = document.createElement('li');
+        li.className = 'document-item';
+        li.style.borderLeftColor = clusterHex(doc.cluster_id);
+        li.innerHTML = `<div class="document-title"><a href="${doc.url}" target="_blank">${doc.title||'Untitled'}</a><span class="quality-badge ${badge}">${(q*100).toFixed(0)}%</span></div><div class="document-meta">${doc.domain||''} &middot; ${doc.content_type||'unknown'} &middot; Cluster ${doc.cluster_id ?? 'N/A'}</div>`;
+        list.appendChild(li);
+    });
+}
+
+/* ===== Search ===== */
+async function performSearch(query) {
+    if (!query.trim()) {
+        clearSearch();
+        return;
+    }
+
+    try {
+        const res = await fetch(`${API}/search/meili?q=${encodeURIComponent(query)}&limit=${searchResultsLimit}`);
+        const data = await res.json();
+
+        if (data.error) {
+            console.error('Search error:', data.error);
+            renderSearchResults([], 0, 0);
+            return;
+        }
+
+        const hits = data.hits || [];
+        matchedIds = new Set(hits.map(h => h.id));
+
+        renderSearchResults(hits, data.estimatedTotalHits || 0, data.processingTimeMs || 0);
+        updateDeck();
+    } catch (e) {
+        console.error('Search failed:', e);
+    }
+}
+
+function clearSearch() {
+    matchedIds = null;
+    document.getElementById('search-input').value = '';
+    document.getElementById('search-results').classList.remove('visible');
+    document.getElementById('search-meta').classList.remove('visible');
+    document.getElementById('search-clear').classList.remove('visible');
+    document.getElementById('search-bar').classList.remove('has-results');
+    updateDeck();
+}
+
+function renderSearchResults(hits, totalHits, timeMs) {
+    document.getElementById('search-clear').classList.add('visible');
+    document.getElementById('search-bar').classList.add('has-results');
+
+    // Meta line
+    const meta = document.getElementById('search-meta');
+    const mapped = hits.filter(h => allMappings.some(m => m.doc_id === h.id)).length;
+    meta.textContent = `${hits.length} of ~${totalHits.toLocaleString()} results (${timeMs}ms) · ${mapped} on map`;
+    meta.classList.add('visible');
+
+    // Results list
+    const container = document.getElementById('search-results');
+    container.innerHTML = '';
+
+    if (hits.length === 0) {
+        container.innerHTML = '<div style="padding:12px;color:#666;font-size:12px;text-align:center">No results found</div>';
+    } else {
+        hits.forEach(hit => {
+            const q = hit.quality_score || 0;
+            const item = document.createElement('div');
+            item.className = 'search-result-item';
+            item.innerHTML = `<div class="search-result-title">${hit.title || hit.url || 'Untitled'}</div>`
+                + `<div class="search-result-meta">${hit.domain || ''} · ${(q*100).toFixed(0)}% quality</div>`;
+            item.onclick = () => {
+                const point = allMappings.find(m => m.doc_id === hit.id);
+                if (point && deckgl) {
+                    deckgl.setProps({
+                        initialViewState: {
+                            ...currentViewState,
+                            target: [point.x, point.y, 0],
+                            zoom: Math.max(currentViewState.zoom, 2),
+                            transitionDuration: 400,
+                        }
+                    });
+                } else if (hit.url) {
+                    window.open(hit.url, '_blank');
+                }
+            };
+            container.appendChild(item);
+        });
+    }
+
+    container.classList.add('visible');
+}
+
+/* ===== Sidebar Toggle ===== */
+document.getElementById('sidebar-toggle').onclick = () => {
+    const sb = document.getElementById('sidebar');
+    sb.classList.toggle('collapsed');
+    const btn = document.getElementById('sidebar-toggle');
+    btn.innerHTML = sb.classList.contains('collapsed') ? '&#9656;' : '&#9776;';
+    // Resize deck.gl canvas after sidebar transition
+    setTimeout(() => { if (deckgl) deckgl.redraw(); }, 280);
+};
+
+/* ===== Events ===== */
+document.querySelectorAll('.tab').forEach(tab => {
+    tab.onclick = () => {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        const v = tab.dataset.view;
+        document.getElementById('deck-container').style.display = v === 'map' ? 'block' : 'none';
+        document.getElementById('list-view').style.display = v === 'list' ? 'flex' : 'none';
+        if (v === 'list') loadDocuments({ limit:50, content_type:selectedType, min_quality:minQuality });
+        if (v === 'map' && deckgl) deckgl.redraw();
+    };
+});
+
+/* Search input: debounced search on keyup, immediate on Enter, clear on Escape */
+document.getElementById('search-input').addEventListener('input', e => {
+    clearTimeout(searchDebounceTimer);
+    const q = e.target.value;
+    if (!q.trim()) { clearSearch(); return; }
+    document.getElementById('search-clear').classList.add('visible');
+    searchDebounceTimer = setTimeout(() => performSearch(q), 300);
+});
+document.getElementById('search-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+        clearTimeout(searchDebounceTimer);
+        performSearch(e.target.value);
+    } else if (e.key === 'Escape') {
+        clearSearch();
+        e.target.blur();
+    }
+});
+document.getElementById('search-clear').onclick = () => clearSearch();
+
+/* Search results limit slider */
+document.getElementById('search-limit').oninput = e => {
+    document.getElementById('search-limit-value').textContent = e.target.value;
+};
+document.getElementById('search-limit').onchange = e => {
+    searchResultsLimit = parseInt(e.target.value);
+    const q = document.getElementById('search-input').value;
+    if (q.trim()) performSearch(q);
+};
+
+document.getElementById('filter-type').onchange = e => { selectedType = e.target.value; applyFilters(); };
+document.getElementById('filter-quality').oninput = e => { document.getElementById('quality-value').textContent = e.target.value + '%'; };
+document.getElementById('filter-quality').onchange = e => { minQuality = e.target.value / 100; applyFilters(); };
+document.getElementById('mapping-select').onchange = e => {
+    document.getElementById('load-overlay').classList.remove('hidden');
+    loadMappings(e.target.value || null);
+};
+document.getElementById('zoom-in').onclick = () => { if (currentViewState) deckgl.setProps({ initialViewState: { ...currentViewState, zoom: currentViewState.zoom + 0.5, transitionDuration:200 } }); };
+document.getElementById('zoom-out').onclick = () => { if (currentViewState) deckgl.setProps({ initialViewState: { ...currentViewState, zoom: currentViewState.zoom - 0.5, transitionDuration:200 } }); };
+document.getElementById('reset-view').onclick = () => { if (initialViewState) deckgl.setProps({ initialViewState: { ...initialViewState, transitionDuration:200 } }); };
+document.getElementById('toggle-lines').onclick = () => {
+    showConnections = !showConnections;
+    document.getElementById('toggle-lines').style.background = showConnections ? '#00d4ff33' : '#16213ecc';
+    updateDeck();
+};
+
+/* ===== Init ===== */
+loadStats();
+loadMappingList();
+loadMappings();
+</script>
 </body>
 </html>
