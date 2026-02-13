@@ -22,8 +22,7 @@ from typing import List, Optional, Set, Tuple, Dict, Any
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 import numpy as np
 
-from common.logging.logger import get_logger
-from common.config import config
+from atlas_core import config, get_logger
 
 logger = get_logger("deduplication")
 

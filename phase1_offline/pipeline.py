@@ -29,8 +29,8 @@ from pathlib import Path
 from queue import Queue
 from typing import Dict, Any, List, Optional
 
-from common.logging.logger import get_logger, setup_logger
-from common.config import config
+from atlas_core import config, get_logger
+from common.logging.logger import setup_logger
 from common.database import db
 from phase1_offline.producer import Producer, MultiProducer
 from phase1_offline.resource_governor import MemoryGovernor

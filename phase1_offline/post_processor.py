@@ -1,40 +1,37 @@
 """
-Post-processor for deferred scoring, filtering, FPS selection, and deduplication.
-
-Runs as a standalone stage after the batch pipeline has stored documents.
-Processes unscored documents (quality_profile_used='pending') in batches.
-
-Workflow:
-1. Query unscored documents from database
-2. Load full text from document_texts table
-3. Detect content type
-4. Compute quality scores using calibrated weights
-5. Compute Wilson scores
-6. Run SimHash dedup
-7. Optionally run FPS selection
-8. Update documents table with scores
+Stage-2 post-processing for Phase 1:
+GPU-scoring, GPU-deduplication, and GPU mapping (project + cluster).
 """
 
 import json
 import time
-from typing import Dict, Any, List, Optional
-from urllib.parse import urlparse
+import uuid
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Tuple
 
-from common.logging.logger import get_logger
-from common.config import config
+import torch
+
+from atlas_core import config, get_logger, tensor_ops
+from atlas_core.errors import AtlasPipelineError
 from common.database import db as _default_db
-from common.repositories import DocumentRepository, DocumentTextRepository
 from common.qdrant_manager import QdrantManager
+from common.repositories import DocumentRepository, DocumentTextRepository
 from curation.scoring import ScoringPipeline
 from curation.scoring.detection import RuleBasedContentTypeDetector
-from phase1_offline.deduplication import Deduplicator, compute_content_hash
-from phase1_offline.fps_sampler import FarthestPointSampler
 
-logger = get_logger("post_processor")
+logger = get_logger("phase1.post_processor")
+
+
+def _safe_qdrant_id(doc_id: str) -> Optional[str]:
+    """Convert document id to UUID string when possible."""
+    try:
+        return str(uuid.UUID(doc_id))
+    except Exception:
+        return None
 
 
 class PostProcessor:
-    """Standalone scoring/filtering/FPS/dedup stage for batch-processed documents."""
+    """Batch post-processor aligned with guide sections 4/5/6."""
 
     def __init__(
         self,
@@ -52,30 +49,40 @@ class PostProcessor:
         self._text_repo = text_repo or DocumentTextRepository(self._database)
         self._detector = content_type_detector or RuleBasedContentTypeDetector()
 
-        # Configuration
-        self.quality_threshold = config.get("batch_processing.quality_threshold")
-        self.quality_alpha = config.get("batch_processing.quality_weight_alpha")
-        self.novelty_threshold = config.get("batch_processing.novelty_threshold")
+        self.quality_threshold = config.require("batch_processing.quality_threshold")
+        self._dedup_threshold = self._resolve_dedup_threshold()
+        self._mapping_sample = int(config.require("mapping.sample_for_fit"))
 
-        # Deduplicator
-        expected_docs = config.get("batch_processing.expected_documents")
-        self.deduplicator = Deduplicator(expected_documents=expected_docs)
-
-        # FPS sampler
-        self.fps_sampler = FarthestPointSampler(
-            quality_weight_alpha=self.quality_alpha,
-            use_qdrant=False,
-        )
-
-        # Statistics
         self._stats = {
-            'total_processed': 0,
-            'scored': 0,
-            'quality_rejected': 0,
-            'dedup_rejected': 0,
-            'accepted': 0,
-            'errors': 0,
+            "total_processed": 0,
+            "scored": 0,
+            "quality_rejected": 0,
+            "dedup_rejected": 0,
+            "accepted": 0,
+            "errors": 0,
+            "embedded_for_dedup": 0,
+            "mapped": 0,
         }
+
+    def _resolve_dedup_threshold(self) -> float:
+        """
+        Resolve cosine dedup threshold without silent defaults.
+        Prefer the new key; fall back to legacy embedding key.
+        """
+        new_value = config.get("deduplication.cosine_threshold")
+        if new_value is not None:
+            return float(new_value)
+        legacy_value = config.get("deduplication.embedding_similarity_threshold")
+        if legacy_value is not None:
+            logger.warning(
+                "Using legacy deduplication.embedding_similarity_threshold; "
+                "please migrate to deduplication.cosine_threshold"
+            )
+            return float(legacy_value)
+        raise AtlasPipelineError(
+            "post_processor",
+            "Missing deduplication.cosine_threshold (or legacy embedding_similarity_threshold)",
+        )
 
     def run(
         self,
@@ -83,149 +90,223 @@ class PostProcessor:
         quality_threshold: Optional[float] = None,
         skip_fps: bool = False,
         skip_dedup: bool = False,
-    ):
-        """
-        Process unscored documents in batches.
-
-        Args:
-            batch_size: Number of documents to process per batch
-            quality_threshold: Override minimum quality score (None = use config)
-            skip_fps: Skip FPS selection step
-            skip_dedup: Skip SimHash dedup step
-        """
+    ) -> Dict[str, Any]:
         if quality_threshold is not None:
             self.quality_threshold = quality_threshold
 
         logger.info(
-            f"PostProcessor starting: batch_size={batch_size}, "
-            f"quality_th={self.quality_threshold}, skip_fps={skip_fps}, "
-            f"skip_dedup={skip_dedup}"
+            "PostProcessor start batch_size=%d quality_th=%.3f skip_fps=%s skip_dedup=%s",
+            batch_size,
+            self.quality_threshold,
+            skip_fps,
+            skip_dedup,
         )
-
         start_time = time.time()
         batch_num = 0
 
         while True:
-            # Fetch next batch of unscored documents
             batch = self._text_repo.get_unscored_batch(batch_size)
             if not batch:
-                logger.info("No more unscored documents to process")
                 break
-
             batch_num += 1
-            logger.info(f"Processing batch {batch_num}: {len(batch)} documents")
-
-            for doc_id, text in batch:
-                try:
-                    self._process_document(
-                        doc_id, text,
-                        skip_fps=skip_fps,
-                        skip_dedup=skip_dedup,
-                    )
-                    self._stats['total_processed'] += 1
-                except Exception as e:
-                    logger.error(f"Error processing {doc_id}: {e}")
-                    self._stats['errors'] += 1
-
-            # Log batch progress
-            elapsed = time.time() - start_time
-            rate = self._stats['total_processed'] / max(elapsed, 1)
+            self._process_batch(batch=batch, skip_dedup=skip_dedup)
+            elapsed = max(time.time() - start_time, 1.0)
             logger.info(
-                f"Batch {batch_num} complete: "
-                f"processed={self._stats['total_processed']}, "
-                f"scored={self._stats['scored']}, "
-                f"rejected={self._stats['quality_rejected']}, "
-                f"rate={rate:.1f} docs/s"
+                "Batch %d done processed=%d scored=%d dedup=%d rate=%.2f docs/s",
+                batch_num,
+                self._stats["total_processed"],
+                self._stats["scored"],
+                self._stats["dedup_rejected"],
+                self._stats["total_processed"] / elapsed,
             )
 
-        elapsed = time.time() - start_time
-        logger.info(
-            f"PostProcessor finished in {elapsed:.1f}s: {self._stats}"
-        )
-        return self._stats
+        total_elapsed = time.time() - start_time
+        logger.info("PostProcessor finished in %.2fs stats=%s", total_elapsed, self._stats)
+        return dict(self._stats)
 
-    def _process_document(
-        self,
-        doc_id: str,
-        text: str,
-        skip_fps: bool = False,
-        skip_dedup: bool = False,
-    ):
-        """Process a single document: score, dedup, optionally FPS."""
-        # Get document metadata from DB
-        doc = self._doc_repo.get_by_id(doc_id)
-        metadata = {}
-        if doc:
-            metadata = {
-                'url': doc.url,
-                'title': doc.title,
-                'domain': doc.domain,
-            }
+    def _process_batch(self, batch: List[Tuple[str, str]], skip_dedup: bool) -> None:
+        doc_rows: List[Dict[str, Any]] = []
+        metric_names: List[str] = list(self._pipeline.registry.names)
+        if not metric_names:
+            raise AtlasPipelineError("post_processor", "scoring registry has no metrics")
 
-        # 1. Detect content type
-        content_type = self._detector.detect(text, metadata)
+        for doc_id, text in batch:
+            try:
+                doc = self._doc_repo.get_by_id(doc_id)
+                metadata = {
+                    "url": doc.url if doc else "",
+                    "title": doc.title if doc else "",
+                    "domain": doc.domain if doc else "",
+                }
+                content_type = self._detector.detect(text, metadata)
+                raw_metrics = self._pipeline.compute_raw_metrics(text, metadata)
+                metric_vector = [float(raw_metrics.get(name, 0.0)) for name in metric_names]
 
-        # 2. Compute quality score
-        raw_metrics = self._pipeline.compute_raw_metrics(text, metadata)
-        quality_score = self._pipeline.compute_score(raw_metrics, content_type)
-
-        # 3. SimHash dedup check
-        if not skip_dedup:
-            content_hash = compute_content_hash(text)
-            dedup_result = self.deduplicator.check_content(
-                doc_id=content_hash, text=text, use_minhash=False
-            )
-            if dedup_result.is_duplicate:
-                self._stats['dedup_rejected'] += 1
-                self._update_document_score(
-                    doc_id, quality_score, raw_metrics, content_type,
-                    status='duplicate'
+                doc_rows.append(
+                    {
+                        "doc_id": doc_id,
+                        "text": text,
+                        "metadata": metadata,
+                        "content_type": content_type,
+                        "raw_metrics": raw_metrics,
+                        "metric_vector": metric_vector,
+                    }
                 )
-                return
+            except Exception as exc:
+                logger.error("Batch prep failed for %s: %s", doc_id, exc)
+                self._stats["errors"] += 1
 
-            # Register for future dedup checks
-            self.deduplicator.register_content(doc_id, text)
+        if not doc_rows:
+            return
 
-        # 4. Update document with scores
-        self._update_document_score(
-            doc_id, quality_score, raw_metrics, content_type,
-            status='active'
-        )
-        self._stats['scored'] += 1
+        scores, wilson_scores = self._gpu_score_batch(doc_rows=doc_rows, metric_names=metric_names)
+        duplicate_mask = self._gpu_duplicate_mask(doc_rows=doc_rows, skip_dedup=skip_dedup)
 
-        # 5. Quality threshold check (flag but don't delete)
-        if quality_score < self.quality_threshold:
-            self._stats['quality_rejected'] += 1
-        else:
-            self._stats['accepted'] += 1
+        self._apply_score_updates(doc_rows, scores, wilson_scores, duplicate_mask)
+        self._run_gpu_mapping(doc_rows=doc_rows, scores=scores)
+        self._stats["total_processed"] += len(doc_rows)
 
-    def _update_document_score(
+    def _gpu_score_batch(
         self,
-        doc_id: str,
-        quality_score: float,
-        raw_metrics: Dict,
-        content_type: str,
-        status: str = 'active',
-    ):
-        """Update document with computed quality scores."""
-        positive = int(quality_score * 100)
-        wilson = self._pipeline.compute_wilson_score(positive, 100)
+        doc_rows: List[Dict[str, Any]],
+        metric_names: List[str],
+    ) -> Tuple[List[float], List[float]]:
+        features = torch.tensor([row["metric_vector"] for row in doc_rows], dtype=torch.float32)
+        positive_counts = (features > 0.5).sum(dim=1).float()
+        total_counts = torch.full_like(positive_counts, fill_value=len(metric_names), dtype=torch.float32)
+
+        scores = torch.zeros(features.shape[0], dtype=torch.float32)
+        indices_by_type: Dict[str, List[int]] = defaultdict(list)
+        for idx, row in enumerate(doc_rows):
+            indices_by_type[row["content_type"]].append(idx)
+
+        for content_type, indices in indices_by_type.items():
+            weights_dict = self._pipeline.get_weights(content_type)
+            weights = torch.tensor(
+                [float(weights_dict.get(name, 0.0)) for name in metric_names],
+                dtype=torch.float32,
+            )
+            idx_tensor = torch.tensor(indices, dtype=torch.long)
+            part_features = features.index_select(0, idx_tensor)
+            part_scores = tensor_ops.score(part_features, weights)
+            scores.index_copy_(0, idx_tensor, part_scores.cpu())
+
+        wilson = tensor_ops.wilson_score(positive_counts=positive_counts, total_counts=total_counts)
+        return scores.tolist(), wilson.tolist()
+
+    def _gpu_duplicate_mask(self, doc_rows: List[Dict[str, Any]], skip_dedup: bool) -> List[bool]:
+        if skip_dedup:
+            return [False] * len(doc_rows)
+
+        vectors: List[List[float]] = []
+        vector_indices: List[int] = []
+
+        if not self._qdrant_mgr.available:
+            logger.warning("Qdrant unavailable; skipping GPU deduplication")
+            return [False] * len(doc_rows)
+
+        for idx, row in enumerate(doc_rows):
+            qdrant_id = _safe_qdrant_id(row["doc_id"])
+            if qdrant_id is None:
+                continue
+            records = self._qdrant_mgr.retrieve(ids=[qdrant_id], with_vectors=True)
+            if not records:
+                continue
+            vector = records[0].vector
+            if vector:
+                vectors.append(vector)
+                vector_indices.append(idx)
+
+        if not vectors:
+            return [False] * len(doc_rows)
+
+        embeddings = torch.tensor(vectors, dtype=torch.float32)
+        duplicate_submask = tensor_ops.find_duplicates(
+            embeddings=embeddings,
+            threshold=float(self._dedup_threshold),
+        ).tolist()
+        duplicate_mask = [False] * len(doc_rows)
+        for local_idx, global_idx in enumerate(vector_indices):
+            duplicate_mask[global_idx] = bool(duplicate_submask[local_idx])
+
+        self._stats["embedded_for_dedup"] += len(vectors)
+        return duplicate_mask
+
+    def _apply_score_updates(
+        self,
+        doc_rows: List[Dict[str, Any]],
+        scores: List[float],
+        wilson_scores: List[float],
+        duplicate_mask: List[bool],
+    ) -> None:
+        updates: List[Tuple[str, float, str, str, float, str]] = []
+
+        for idx, row in enumerate(doc_rows):
+            score = float(scores[idx])
+            wilson = float(wilson_scores[idx])
+            is_duplicate = bool(duplicate_mask[idx])
+            status = "duplicate" if is_duplicate else "active"
+
+            if is_duplicate:
+                self._stats["dedup_rejected"] += 1
+            elif score < self.quality_threshold:
+                self._stats["quality_rejected"] += 1
+            else:
+                self._stats["accepted"] += 1
+
+            updates.append(
+                (
+                    row["doc_id"],
+                    score,
+                    json.dumps(row["raw_metrics"]),
+                    row["content_type"],
+                    wilson,
+                    status,
+                )
+            )
 
         try:
-            self._doc_repo.update_score(
-                doc_id=doc_id,
-                quality_score=quality_score,
-                quality_components=json.dumps(raw_metrics),
-                content_type=content_type,
-                wilson_score=wilson,
-                status=status,
-            )
-        except Exception as e:
-            logger.error(f"Failed to update document {doc_id}: {e}")
+            self._doc_repo.update_scores_batch(updates)
+            self._stats["scored"] += len(updates)
+        except Exception as exc:
+            logger.error("Batch DB update failed: %s", exc)
+            self._stats["errors"] += len(updates)
+
+    def _run_gpu_mapping(self, doc_rows: List[Dict[str, Any]], scores: List[float]) -> None:
+        if not self._qdrant_mgr.available:
+            return
+
+        vectors: List[List[float]] = []
+        doc_ids: List[str] = []
+        for idx, row in enumerate(doc_rows):
+            qdrant_id = _safe_qdrant_id(row["doc_id"])
+            if qdrant_id is None:
+                continue
+            records = self._qdrant_mgr.retrieve(ids=[qdrant_id], with_vectors=True)
+            if not records or not records[0].vector:
+                continue
+            vectors.append(records[0].vector)
+            doc_ids.append(row["doc_id"])
+
+        if len(vectors) < 3:
+            return
+
+        if len(vectors) > self._mapping_sample:
+            vectors = vectors[: self._mapping_sample]
+            doc_ids = doc_ids[: self._mapping_sample]
+
+        try:
+            embeddings = torch.tensor(vectors, dtype=torch.float32)
+            coords_2d = tensor_ops.project_2d(embeddings)
+            labels = tensor_ops.cluster(coords_2d)
+            updates = []
+            for i, doc_id in enumerate(doc_ids):
+                importance = float(scores[i]) if i < len(scores) else 0.0
+                updates.append((int(labels[i].item()), importance, doc_id))
+            self._doc_repo.update_mappings_batch(updates)
+            self._stats["mapped"] += len(updates)
+        except Exception as exc:
+            logger.warning("GPU mapping skipped for current batch: %s", exc)
 
     def get_stats(self) -> Dict[str, Any]:
-        """Returns post-processing statistics."""
-        return {
-            **self._stats,
-            'dedup_stats': self.deduplicator.get_stats(),
-        }
+        return dict(self._stats)

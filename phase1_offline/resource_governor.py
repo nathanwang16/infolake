@@ -10,7 +10,7 @@ import threading
 import time
 from typing import Optional, Callable
 
-from common.logging.logger import get_logger
+from atlas_core import get_logger
 
 logger = get_logger("resource_governor")
 

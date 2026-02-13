@@ -26,8 +26,8 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from common.logging.logger import setup_logger, get_logger
-from common.config import config
+from atlas_core import config, get_logger
+from common.logging.logger import setup_logger
 from phase1_offline.post_processor import PostProcessor
 
 logger = get_logger("post_process")

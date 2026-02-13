@@ -30,8 +30,7 @@ from typing import Dict, Any, List, Optional
 from urllib.parse import urlparse
 import numpy as np
 
-from common.logging.logger import get_logger
-from common.config import config
+from atlas_core import config, get_logger
 from common.database import db
 from common.models import DocumentCreate
 from common.repositories import DocumentRepository, DocumentTextRepository

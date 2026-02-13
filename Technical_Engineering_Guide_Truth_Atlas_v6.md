@@ -4,1263 +4,621 @@
 
 | Field           | Value              |
 | --------------- | ------------------ |
-| Version         | 1.0.0              |
-| Last Updated    | January 2026       |
-| Status          | MVP Semi Complete  |
+| Version         | 2.0.0              |
+| Last Updated    | February 2026      |
+| Status          | Phase 1 Complete, GPU Migration Planned |
 | Target Audience | Software Engineers |
 
 ---
 
 ## 1. Executive Summary
 
-Truth Atlas is a continuous pipeline that builds a curated, navigable map of high-quality web content. The system operates in two phases: **batch processing of existing dumps** (using farthest-point sampling for maximum coverage) and **active exploration** (using gap detection and expert query synthesis to discover what dumps missed).
+Truth Atlas builds a curated, navigable map of high-quality web content. The system ingests web dumps, embeds and scores documents, and projects them into a navigable 2D atlas with topic clustering.
 
-**Core Design Principles:**
+**Core Principles:**
 
-1. **Separation of concerns**: Each pipeline phase is an independent module communicating through shared data stores
-2. **Data source agnosticism**: The atlas accepts documents from any source; source-specific logic is isolated in adapters
-3. Essential core package agnostic: The project should maintain a high quality, reduced implementation core code library. All the actual implementations should use that library.
-4. ~~**Maximum coverage sampling**: Use theoretically principled farthest-point sampling to ensure uniform coverage across embedding space~~
-5. **Simple parallelism**: Producer-consumer pattern with queues; no distributed coordination needed for single-machine deployment
-6. ~~**Epistemic preservation**: Classify stance (consensus/contested/dissent) separately from quality; preserve well-reasoned minority views~~
-7. ~~**Domain adaptivity**: Different content types are scored with calibrated weights derived from Golden Set evaluation~~
-8. **Fault tolerance**: Any module can crash and restart without corrupting state; all operations are idempotent or transactional
-9. **Debuggability**: Complete audit trail for every document; any intermediate state can be inspected or visualized
-10. **Extract-first storage**: Store extracted text and metadata immediately; no raw HTML archival (use trafilatura/readability for extraction)
-11. **Embedding stability**: Use stable embedding model (bge-small) for navigation; add rerankers for quality later if needed
-12. ~~**Cartographic validation**: Apply spatial statistics techniques (topic-cluster CV, QADI metrics, Gini coefficients) to ensure calibration generalizes and coverage is equitable~~
+1. **Core-library-first**: Build a minimal, high-quality `atlas_core` library first. All pipeline modules import from it — never the reverse.
+2. **GPU-first computation**: All linear algebra (embedding, scoring, dedup, clustering, projection) runs on GPU via PyTorch tensors. CPU is used only for I/O-bound work (HTTP fetching, HTML extraction).
+3. **Hypergraph data model**: Documents and their attributes form a sparse incidence matrix, not a flat relational table. A URL can belong to multiple topics/domains simultaneously without duplication.
+4. **Category-theoretic design**: Functors map heterogeneous data sources into a uniform atlas structure. Sheaf-like contexts allow locally conflicting "truths" to coexist without global contradiction.
+5. **Two-universe storage**: Operational data (fixed-dimension tensors) lives in GPU/VRAM for math. Variable-length content (text, HTML hashes) lives in Parquet/Arrow on disk, accessed only after GPU identifies relevant IDs.
+6. **Separation of concerns**: Each pipeline phase is an independent module communicating through shared stores.
+7. **Fault tolerance**: Idempotent operations, micro-batching (10K rows), VRAM treated as cache over Parquet to survive OOM without state loss.
+8. **Extract-first storage**: Store extracted text immediately via trafilatura. No raw HTML archival.
+9. **Debuggability**: Complete audit trail; any intermediate state inspectable.
 
 **Scale Parameters:**
 
-- Target corpus: 3-50 million documents
-- Storage budget: 2TB (Samsung T9 SSD attached to server)
-- Compute: Single server (Mac Mini M4, 24GB RAM)
+- Target corpus: 3–50M documents
+- Storage: 2TB Samsung T9 SSD
+- Compute: Mac Mini M4 (24GB RAM, MPS GPU, 10core CPU) 
 
 ---
 
 ## 2. System Architecture
 
-### 2.1 Two-Phase Processing Model
+### 2.1 Hypergraph Data Model
+
+Standard graphs connect pairs of nodes. Hypergraphs connect *sets* of nodes through hyperedges, solving two problems:
+
+- **Folding**: An entire domain (e.g., `example.com`) is one hyperedge containing all its URLs — no hairball of pairwise links.
+- **Multi-identity**: A single URL belongs to multiple topics ("AI", "Ethics", "Code") simultaneously by sitting at the intersection of multiple hyperedges.
+
+**Physical representation:** Sparse incidence matrix \( H \) where rows = URLs, columns = attributes (topics, domains, authors, date bins).
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         TRUTH ATLAS: TWO-PHASE MODEL                         │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  PHASE 1: BATCH DUMP PROCESSING (Offline, Parallel)                         │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                                                                      │   │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐               │   │
-│  │  │Marginalia│ │  DMOZ    │ │ Academic │ │ Pinboard │  ... more     │   │
-│  │  │  Dump    │ │ Archive  │ │Citations │ │ Archive  │   dumps       │   │
-│  │  └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘               │   │
-│  │       │            │            │            │                      │   │
-│  │       └────────────┴─────┬──────┴────────────┘                      │   │
-│  │                          ▼                                          │   │
-│  │  ┌──────────────────────────────────────────────────────────────┐  │   │
-│  │  │              PRODUCER-CONSUMER PIPELINE                       │  │   │
-│  │  │  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐  │  │   │
-│  │  │  │ PRODUCER │──►│  QUEUES  │──►│ WORKERS  │──►│  WRITER  │  │  │   │
-│  │  │  │ (filter) │   │          │   │ (N thrd) │   │ (single) │  │  │   │
-│  │  │  └──────────┘   └──────────┘   └──────────┘   └──────────┘  │  │   │
-│  │  └──────────────────────────────────────────────────────────────┘  │   │
-│  │                          │                                          │   │
-│  │                          ▼                                          │   │
-│  │                 ┌─────────────────┐                                 │   │
-│  │                 │  GLOBAL INDEX   │  Single-writer, no locks        │   │
-│  │                 │  (Qdrant HNSW)  │                                 │   │
-│  │                 └────────┬────────┘                                 │   │
-│  │                          │                                          │   │
-│  │  Algorithm: Quality-Weighted Farthest Point Sampling (Lazy Greedy) │   │
-│  │  Guarantee: 2-approximation to optimal coverage                     │   │
-│  │                                                                      │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                 │                                          │
-│                                 ▼                                          │
-│                        ┌─────────────────┐                                 │
-│                        │  ATLAS CORPUS   │                                 │
-│                        └────────┬────────┘                                 │
-│                                 │                                          │
-│  PHASE 2: ACTIVE EXPLORATION (Online, Continuous)                          │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                                                                      │   │
-│  │  ┌─────────────┐      ┌─────────────┐      ┌─────────────┐         │   │
-│  │  │ Gap Detection│ ──► │Query Inversion│ ──► │Search APIs  │         │   │
-│  │  │(Lonely Nodes)│      │(Expert Synth)│      │(Marginalia, │         │   │
-│  │  └─────────────┘      └─────────────┘      │ Kagi, etc.) │         │   │
-│  │        ▲                                    └──────┬──────┘         │   │
-│  │        │                                           │                │   │
-│  │        │              ┌────────────────────────────┘                │   │
-│  │        │              ▼                                             │   │
-│  │        │     ┌─────────────────┐                                    │   │
-│  │        └─────│ Fetch + Score   │──► Add to Atlas (if novel+quality)│   │
-│  │              └─────────────────┘                                    │   │
-│  │                                                                      │   │
-│  │  Algorithm: Lonely node detection (sparse region discovery)         │   │
-│  │  Rate: ~100 novel documents per 6-hour cycle                        │   │
-│  │                                                                      │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+H = [ H_topics (Sparse) | H_domains (Sparse) | H_dates (Dense/Binned) | H_embeddings (Dense) ]
 ```
 
-### 2.2 High-Level Component Diagram
+**Operations via linear algebra:**
+
+| SQL Equivalent             | Tensor Operation                                    |
+| -------------------------- | --------------------------------------------------- |
+| `SELECT WHERE topic='AI'`  | Dot product: \( H \cdot q \) with query vector \( q \) |
+| Find related documents     | Gram matrix: \( H \times H^T \)                    |
+| Clustering                 | GPU-accelerated HDBSCAN (cuML via DLPack)           |
+| Deduplication              | Cosine similarity: \( E \times E^T \) or random projection hashing |
+| FPS sampling               | `torch.cdist` parallel distance argmax              |
+| Gap detection              | Mean k-NN distance (high mean = sparse region)      |
+
+### 2.2 Category Theory as Design Pattern
+
+Category theory is used as a **code architecture pattern**, not a database engine.
+
+**Functors (data integration):** Generic adapter classes that map diverse sources (Marginalia SLOP, DMOZ, HN) into the atlas's uniform tensor structure while preserving each source's structural properties. Each dump adapter is a functor: `Source → Atlas`.
+
+**Sheaves (epistemic context):** A logic layer where "truth" is local. Conflicting claims ("Eggs are bad" vs. "Eggs are good") coexist by assigning them to different contexts (open sets) in the hypergraph. No global contradiction — just locally consistent neighborhoods.
+
+### 2.3 Two-Universe Storage Model
+
+| Universe       | Location       | Contents                                                    | Access Pattern        |
+| -------------- | -------------- | ----------------------------------------------------------- | --------------------- |
+| **Operational** | GPU VRAM / RAM | Composite tensor: embeddings (Float32) + metadata IDs (Int64) + scores (Float32). Pre-allocate spare columns for schema evolution. | Every operation       |
+| **Storage**     | T9 SSD         | Parquet/Arrow: full text, titles, summaries, HTML hashes. SQLite: relational metadata. Qdrant: HNSW vector index. | Post-GPU ID retrieval |
+
+The operational tensor is the primary working surface. The storage universe is accessed only after GPU identifies specific document IDs to retrieve.
+
+### 2.4 Data Flow
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              TRUTH ATLAS SYSTEM                              │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  DATA SOURCES                                                                │
-│  ┌─────────────────────────────┐  ┌─────────────────────────────┐          │
-│  │     DUMPS (Phase 1)         │  │   LIVE SOURCES (Phase 2)    │          │
-│  │  ┌───────┐ ┌───────┐       │  │  ┌───────┐ ┌───────┐        │          │
-│  │  │Margin-│ │ DMOZ  │       │  │  │Margin-│ │ Kagi  │        │          │
-│  │  │alia   │ │Archive│ ...   │  │  │alia   │ │ API   │ ...    │          │
-│  │  │ Dump  │ │       │       │  │  │ API   │ │       │        │          │
-│  │  └───────┘ └───────┘       │  │  └───────┘ └───────┘        │          │
-│  └─────────────────────────────┘  └─────────────────────────────┘          │
-│                │                              │                             │
-│  ══════════════╪══════════════════════════════╪═════════════════════════   │
-│                │                              │                             │
-│  PROCESSING    ▼                              ▼                             │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │                        BATCH SAMPLER (Phase 1)                        │  │
-│  │  Producer → Queues → Workers → Writer (no locks, no agents)          │  │
-│  └──────────────────────────────────────┬───────────────────────────────┘  │
-│                                         │                                   │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │                          EXPLORER (Phase 2)                           │  │
-│  │  Lonely Node Detection │ HDBSCAN Clustering │ Query Inversion │ Fetch │  │
-│  └──────────────────────────────────────┬───────────────────────────────┘  │
-│                                         │                                   │
-│                                         ▼                                   │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │                            CURATOR                                    │  │
-│  │  Content type detection │ Golden-set calibrated scoring │ Wilson     │  │
-│  │  score ranking │ Epistemic classification │ Deduplication │ Accept   │  │
-│  └──────────────────────────────────────┬───────────────────────────────┘  │
-│                                         │                                   │
-│                                         ▼                                   │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │                            MAPPER                                     │  │
-│  │  Semantic projection (UMAP) │ Importance scoring (PageRank)          │  │
-│  │  Topic clustering │ Diversity metrics                                 │  │
-│  └──────────────────────────────────────┬───────────────────────────────┘  │
-│                                         │                                   │
-│                                         ▼                                   │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │                            STORAGE                                    │  │
-│  │  Qdrant (vectors) │ SQLite (metadata) │ Parquet (mappings)           │  │
-│  └──────────────────────────────────────────────────────────────────────┘  │
-│                                                                              │
-│  ══════════════════════════════════════════════════════════════════════    │
-│                                                                              │
-│  TOOLS                                                                       │
-│  ┌────────────────┐ ┌────────────────┐ ┌────────────────┐ ┌──────────────┐ │
-│  │  VISUALIZER    │ │  ORCHESTRATOR  │ │   VERIFIER     │ │  CALIBRATOR  │ │
-│  │  Web UI        │ │  Scheduling    │ │  QADI metrics  │ │  Golden Set  │ │
-│  │  API server    │ │  Coordination  │ │  Topic-CV      │ │  Weight tuning│ │
-│  └────────────────┘ └────────────────┘ └────────────────┘ └──────────────┘ │
-│                                                                              │
-│  ┌────────────────┐                                                         │
-│  │    MONITOR     │ Gini coefficient │ Cluster health │ Drift detection    │
-│  └────────────────┘                                                         │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+PHASE 1 (Batch):
+  Dump → Producer(filter)
+    → AsyncFetch(aiohttp)                                [CPU: I/O-bound]
+    → ExtractPool(trafilatura, ProcessPool)               [CPU: DOM parsing]
+    → Arrow shared memory buffer                          [CPU→GPU handoff]
+    → GPU Embed(nomic-embed-text-v1.5, PyTorch)           [GPU]
+    → Writer(Parquet + Qdrant + SQLite)                   [CPU: I/O]
+    → GPU PostProcess(score, dedup, cluster, project)     [GPU]
+    → Atlas
+
+PHASE 2 (Active, future):
+  Atlas → GPU Gap Detection(k-NN density) → Query Synthesis → Search API
+    → Fetch → Extract → Embed → Score → Atlas (continuous loop)
 ```
 
-### 2.3 Data Flow
-
-```
-PHASE 1 (Batch) - Producer-Consumer with Extract-First:
-Dump → Producer(filter) → url_queue → Workers(fetch,extract,embed) → embed_queue → Writer(FPS,dedupe,score) → Atlas
-                                              │
-                                              ▼
-                                     STORE PARSED CONTENT + METADATA
-                                     (extracted text, title, author, date, raw_html_hash)
-
-PHASE 2 (Active):
-Atlas → Lonely Node Detection → HDBSCAN Clustering → Query Inversion → Search API → Fetch → Extract → Embed → Dedupe → Score → Atlas
-                ▲                                                                                                              │
-                └──────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                                              (continuous loop)
-```
-
-### 2.4 Storage Architecture
-
-With 24GB RAM and 2TB Samsung T9 SSD:
-
-| Tier | Location           | Contents                                                                                             | Access Pattern              |
-| ---- | ------------------ | ---------------------------------------------------------------------------------------------------- | --------------------------- |
-| HOT  | RAM / Internal SSD | Qdrant HNSW index (quantized), SQLite WAL files, active working set                                  | Frequent reads/writes       |
-| WARM | T9 SSD             | Full vector store (memory-mapped), document content (compressed), SQLite databases, Parquet mappings | Regular reads, batch writes |
-| COLD | T9 SSD (archived)  | **Parsed content archive**, historical embeddings (if model changes), full audit logs          | Rare access                 |
-
-**Extract-First Storage (No Raw HTML):**
-
-Instead of storing raw HTML, extract text and metadata immediately using trafilatura/readability. Store only the parsed content, saving significant storage space and simplifying the pipeline.
+### 2.5 Storage Layout
 
 ```
 parsed_archive/
-├── 2025/
-│   ├── 01/
-│   │   ├── 27/
-│   │   │   ├── batch_001.jsonl.zst  # Parsed content + metadata, zstd compressed
-│   │   │   ├── batch_002.jsonl.zst
-│   │   │   └── manifest.json        # URL -> archive path mapping
+├── YYYY/MM/DD/
+│   ├── batch_*.jsonl.zst       # Parsed content, zstd compressed
+│   └── manifest.json           # URL → archive path
+tensors/
+├── embeddings.pt               # PyTorch tensor checkpoint
+├── metadata.pt                 # Metadata ID tensor
+└── scores.pt                   # Score tensor
 ```
-
-**Each archived record contains:** `url`, `raw_html_hash` (provenance), `extracted_text`, `title`, `author`, `publication_date`, `fetch_date`, `extractor_version`, `http_status`, `content_type`
 
 ---
 
-## 3. Phase 1: Batch Dump Processing
+## 3. Core Library (`atlas_core/`)
 
-### 3.1 Data Sources for Dumps
+### 3.1 Design Philosophy
 
-| Source                      | Description                                             | Scale             | Quality Signal                   |
-| --------------------------- | ------------------------------------------------------- | ----------------- | -------------------------------- |
-| Marginalia blog corpus      | ~4,500 quality sites, larger dumps available on request | 100K-1M           | Pre-filtered for quality         |
-| DMOZ/ODP archive            | Human-curated directory (1990s-2000s)                   | ~4M URLs          | Human curation (many dead links) |
-| Pinboard/Delicious archives | Social bookmarking exports                              | 1-10M             | Crowd curation via tagging       |
-| Academic citation URLs      | Extracted from Semantic Scholar, arXiv                  | 10-100M           | Academic provenance              |
-| Common Crawl (filtered)     | Use CC index to sample, don't process raw WARCs         | Petabyte (sample) | Needs heavy filtering            |
-| Hacker News archive         | All submitted URLs with scores                          | ~5M               | Community voting                 |
-| Lobste.rs archive           | Invite-only tech community                              | ~100K             | High signal-to-noise             |
+`atlas_core` is a minimal, dependency-light library that every other module imports. It defines the type system, protocols, tensor operations, and configuration interface. It contains **zero** pipeline logic — only primitives and contracts.
 
-### 3.2 Pre-Filtering Pipeline (Extract-First)
+Development order: **build `atlas_core` first**, then all pipeline modules reference it.
 
-**Key principle:** Extract text and metadata immediately after fetch using trafilatura. Store parsed content, not raw HTML. This trades replay flexibility for 5x storage savings—acceptable since extractor bugs affect <1% of documents.
+### 3.2 Architecture
 
 ```
-RAW DUMP
-    │
-    ▼
-┌─────────────────────────────────────────┐
-│ 1. URL PATTERN FILTER                   │
-│    - Block known spam domains           │
-│    - Block social media, e-commerce     │
-│    - Block URL patterns (login, cart)   │
-│    Speed: ~500K URLs/sec                │
-└─────────────────────────────────────────┘
-    │ (~50% pass)
-    ▼
-┌─────────────────────────────────────────┐
-│ 2. FETCH CONTENT                        │
-│    - Parallel HTTP (100 concurrent)     │
-│    - 5s timeout, 3 retries             │
-│    - Skip if already in atlas           │
-│    Speed: ~100 URLs/sec (network-bound) │
-└─────────────────────────────────────────┘
-    │ (~70% pass - dead links filtered)
-    ▼
-┌─────────────────────────────────────────┐
-│ 3. CONTENT EXTRACTION                   │
-│    - trafilatura / readability          │
-│    - Extract main content + metadata    │
-│    - C4-style cleanup (lorem ipsum,     │
-│      excessive JS, nav menu removal)    │
-│    - Compute raw_html_hash (provenance) │
-│    Speed: ~50 docs/sec                  │
-└─────────────────────────────────────────┘
-    │ (~80% pass - boilerplate-only pages filtered)
-    ▼
-┌─────────────────────────────────────────┐
-│ 4. LANGUAGE FILTER                      │
-│    - fasttext language detection        │
-│    - Keep English only (for MVP)        │
-│    Speed: ~100K docs/sec                │
-└─────────────────────────────────────────┘
-    │ (~80% pass)
-    ▼
-┌─────────────────────────────────────────┐
-│ 5. LENGTH FILTER                        │
-│    - Skip < 100 characters              │
-│    - Skip > 100K characters (truncate)  │
-│    Speed: ~1M docs/sec                  │
-└─────────────────────────────────────────┘
-    │ (~90% pass)
-    ▼
-FILTERED CANDIDATES (ready for embedding)
+atlas_core/
+├── __init__.py           # Public API
+├── types.py              # Domain types: DocumentID, URL, Embedding, HyperedgeLabel
+├── protocols.py          # Protocol definitions (see below)
+├── tensor_ops.py         # GPU tensor operations (embed, score, dedup, project)
+├── hypergraph.py         # Sparse incidence matrix construction and queries
+├── functors.py           # Base functor class for source adapters
+├── config.py             # Singleton config loader (dot-notation, config.json)
+├── errors.py             # Custom exceptions (never silent defaults)
+└── logging.py            # Structured JSON logger (rotating, per-module)
 ```
 
-**Net effect:** From 1M raw URLs → ~250K candidates for embedding.
+### 3.3 Protocols
 
-**Re-extraction fallback:** If trafilatura proves inadequate, re-crawl affected URLs (~1% of corpus) or sample from Wayback Machine for extractor experiments. See `--recrawl` and `--wayback-sample` options.
+All pipeline modules program against these protocols. Implementations are swappable.
 
-### 3.3 Farthest-Point Sampling with Lazy Greedy Optimization
+| Protocol         | Methods                                      | Used By               |
+| ---------------- | -------------------------------------------- | --------------------- |
+| `Embedder`       | `encode(texts) → Tensor`                    | Phase 1 ingestion     |
+| `Scorer`         | `score(features, weights) → Tensor`          | Curator               |
+| `Deduplicator`   | `find_duplicates(embeddings) → mask`         | Post-processor        |
+| `Projector`      | `fit_transform(embeddings) → coords_2d`      | Mapper                |
+| `Clusterer`      | `fit_predict(coords) → labels`               | Mapper                |
+| `AxisScorer`     | `score(domain, quality, type) → float`       | Mapper Z-axis         |
+| `SourceFunctor`  | `read(path) → Iterator[Record]`              | Dump adapters         |
+| `ScoringMetric`  | `compute(text, words, sentences, meta) → float` | Curator metrics    |
 
-**Goal:** Select k documents from n candidates such that selected documents are maximally spread across embedding space.
+### 3.4 Tensor Operations (`tensor_ops.py`)
 
-**Theoretical guarantee:** 2-approximation to optimal k-center coverage.
-
-**Basic Algorithm (Gonzalez):**
-
-```
-FARTHEST_POINT_SAMPLING(candidates, k):
-  
-    INPUT:
-        candidates: list of (id, embedding) pairs, n total
-        k: number of documents to select
-  
-    OUTPUT:
-        selected: list of k document IDs with maximum coverage
-  
-    ALGORITHM:
-        1. selected ← {arbitrary candidate}  // or highest quality
-        2. distances ← [∞] × n  // distance to nearest selected, for each candidate
-  
-        3. REPEAT k-1 times:
-            a. FOR each unselected candidate i:
-                   d ← distance(embedding[i], nearest_in_selected)
-                   distances[i] ← min(distances[i], d)
-  
-            b. next ← argmax(distances)  // candidate farthest from any selected
-            c. selected ← selected ∪ {next}
-  
-        4. RETURN selected
-  
-    COMPLEXITY: O(n × k) naive
-```
-
-**Lazy Greedy Optimization (Minoux's Algorithm):**
-
-The naive algorithm recomputes all distances every iteration. Lazy Greedy exploits the fact that distances only decrease monotonically:
+All core math runs on GPU via PyTorch. These are the building blocks every module calls.
 
 ```
-LAZY_GREEDY_FPS(candidates, k, quality_scores, α=1.0):
-  
-    INPUT:
-        candidates: list of (id, embedding) pairs, n total
-        k: number to select
-        quality_scores: quality score for each candidate
-        α: quality weight (0=pure coverage, 1=balanced)
-  
-    DATA STRUCTURES:
-        upper_bounds[i]: upper bound on candidate i's selection score
-        selected_index: HNSW index of selected embeddings (initially empty)
-        priority_queue: max-heap ordered by upper_bounds
-  
-    ALGORITHM:
-        1. // Initialize with quality-weighted bounds
-           FOR each candidate i:
-               upper_bounds[i] ← ∞ × quality_scores[i]^α
-           priority_queue ← build_max_heap(upper_bounds)
-  
-        2. // Select first (highest quality)
-           first ← argmax(quality_scores)
-           selected_index.add(first)
-           YIELD first
-  
-        3. WHILE |selected| < k:
-  
-            a. // Pop candidate with highest upper bound
-               candidate ← priority_queue.pop_max()
-  
-            b. // Compute actual score (lazy evaluation)
-               nearest, dist ← selected_index.search(candidate.embedding, k=1)
-               actual_score ← dist × quality_scores[candidate]^α
-  
-            c. // If actual score matches upper bound, select it
-               IF actual_score >= priority_queue.peek_max():
-                   selected_index.add(candidate)
-                   YIELD candidate
-   
-               ELSE:
-                   // Update upper bound and re-insert
-                   upper_bounds[candidate] ← actual_score
-                   priority_queue.push(candidate, actual_score)
-  
-        4. RETURN selected
-  
-    COMPLEXITY: O(n log n) build + O(k × log n × log |selected|) amortized
-                Typically 100-1000x faster than naive for large k
-  
-    KEY INSIGHT: Most candidates are evaluated once or twice, not k times.
-                 Only candidates near the selection frontier need re-evaluation.
+# Embedding: batch encode via model on GPU
+embed(texts, model, device) → Tensor[N, D]
+
+# Scoring: weighted feature projection (dot product, no iteration)
+score(feature_matrix, weight_vector) → Tensor[N]
+// Replaces: per-document scoring loop
+
+# Wilson score: vectorized element-wise across entire corpus
+wilson_score(positive_counts, total_counts, z=1.96) → Tensor[N]
+
+# Deduplication: cosine similarity via gram matrix
+find_duplicates(E, threshold=0.95) → duplicate_mask
+// E @ E.T computed on GPU, threshold applied
+
+# FPS: parallel distance argmax
+farthest_point_sample(embeddings, k, quality_weights, α) → selected_ids
+// torch.cdist for parallel distance computation
+
+# Gap detection: inverted density estimation
+find_gaps(embeddings, k_neighbors) → gap_scores
+// High mean k-NN distance = sparse region = gap
+
+# Projection: UMAP on GPU (or cuML via DLPack)
+project_2d(embeddings, n_neighbors, min_dist) → coords_2d
 ```
 
-**Quality-Weighted Selection Criterion:**
+### 3.5 Hypergraph (`hypergraph.py`)
+
+Constructs and queries the sparse incidence matrix.
 
 ```
-score(c) = min_distance(c) × quality_score(c)^α
+BUILD_HYPERGRAPH(documents, topic_labels, domain_labels):
+    H_topics ← sparse_matrix(docs × topics)     # from clustering
+    H_domains ← sparse_matrix(docs × domains)    # from URL parsing
+    H_dates ← dense_binned(docs × date_bins)     # publication dates
+    H_embeddings ← dense(docs × embedding_dim)   # from embedder
 
-TRADEOFFS:
-    α = 0.0: Pure coverage, ignores quality entirely
-    α = 0.5: Mild quality preference
-    α = 1.0: Balanced (recommended default)
-    α = 2.0: Strong quality preference, may sacrifice coverage
+    RETURN composite_tensor = concat(H_topics, H_domains, H_dates, H_embeddings)
+
+QUERY(H, query_vector):
+    scores ← H @ query_vector        # dot product filtering
+    RETURN top_k(scores)
 ```
 
-**Quality score source for dumps:**
+### 3.6 Configuration & Errors
 
-- If dump includes quality signals (Marginalia, HN score): append a boost in quality score
-- Otherwise: compute lightweight quality proxy:
-  - Content length (log-normalized)
-  - Domain reputation (lookup table)
-  - Structural signals (has headings, paragraphs)
+- `config.py`: Singleton loader. `config.get("section.key", default)`. Sources from `config.json`.
+- `errors.py`: All parameters required — no silent defaults. Missing values raise `AtlasConfigError`.
+- `logging.py`: Per-module JSONL to `logs/`. Console INFO+, file DEBUG+. Rotating 10MB/5 backups.
 
-### 3.4 HNSW-Accelerated Implementation
+---
 
-```
-FARTHEST_POINT_SAMPLING_HNSW(candidates, k, batch_size=1000):
-  
-    INPUT:
-        candidates: list of (id, embedding, quality_score) pairs
-        k: number to select
-        batch_size: candidates to evaluate per iteration
-  
-    DATA STRUCTURES:
-        candidate_index: HNSW index of all candidate embeddings
-        selected_index: HNSW index of selected embeddings (initially empty)
-        candidate_set: set of unselected candidate IDs
-        upper_bounds: lazy greedy upper bounds
-  
-    ALGORITHM:
-        1. Build candidate_index from all embeddings  // O(n log n)
-  
-        2. first ← argmax(quality_score)  // start with highest quality
-        3. selected_index.add(first)
-        4. candidate_set.remove(first)
-        5. Initialize upper_bounds with quality-weighted ∞
-  
-        6. WHILE |selected_index| < k AND candidate_set not empty:
-  
-            a. // Get top candidates by upper bound
-               batch ← top_k_by_upper_bound(candidate_set, batch_size)
-  
-            b. // Batch query: find distance to nearest selected for each
-               FOR each candidate in batch:
-                   nearest, dist ← selected_index.search(candidate.embedding, k=1)
-                   candidate.actual_score ← dist × quality_score^α
-  
-            c. // Find best in batch
-               best ← argmax(batch, key=actual_score)
-  
-            d. // Lazy check: is best actually best globally?
-               IF best.actual_score >= next_upper_bound_outside_batch:
-                   selected_index.add(best)
-                   candidate_set.remove(best)
-               ELSE:
-                   // Update bounds and continue
-                   update_upper_bounds(batch)
-  
-        7. RETURN selected_index.get_all_ids()
-  
-    COMPLEXITY: O(n log n) build + O(k × batch_size × log |selected|) selection
-                ≈ O(n log n) for typical parameters
-```
+## 4. Phase 1: Batch Dump Processing
 
-### 3.5 Two-Stage Pipeline Architecture
+### 4.1 Overview
 
-**Breaking change from v1.0:** The pipeline has been refactored into two stages for improved throughput and flexibility.
+Two-stage pipeline. Stage 1: high-throughput ingestion (CPU extraction → GPU embedding → store). Stage 2: GPU-accelerated post-processing (score, dedup, cluster, project). All parameters from `config.json`.
 
-**Stage 1 (Batch Ingestion):** High-throughput storage-only pipeline
-**Stage 2 (Post-Processing):** Deferred scoring, filtering, and selection
+### 4.2 Data Sources
+
+| Source              | Scale     | Quality Signal           | Adapter Status |
+| ------------------- | --------- | ------------------------ | -------------- |
+| Marginalia SLOP     | 100K–1M   | Pre-filtered for quality | Implemented    |
+| DMOZ/ODP archive    | ~4M URLs  | Human curation           | Planned        |
+| Pinboard/Delicious  | 1–10M     | Crowd tagging            | Planned        |
+| Academic citations  | 10–100M   | Academic provenance      | Planned        |
+| Hacker News         | ~5M       | Community voting         | Planned        |
+
+Each source adapter is a `SourceFunctor` (from `atlas_core`) mapping source-specific records into the atlas's uniform `Record` type.
+
+### 4.3 Pipeline Architecture
 
 ```
-STAGE 1: BATCH INGESTION (async + multiprocess)
-
-    ARCHITECTURE:
-        ┌──────────────┐     ┌─────────────────┐     ┌──────────────┐
-        │   PRODUCER   │────►│  url_queue      │────►│ AsyncFetcher │
-        │  (1 process) │     │                 │     │ (event loop) │
-        └──────────────┘     └─────────────────┘     └──────┬───────┘
-                                                             │
-                             ┌─────────────────┐            ▼
-                             │  html_queue     │◄───────────┘
-                             └────────┬────────┘
-                                      │
-                             ┌────────▼────────┐     ┌──────────────┐
-                             │  ExtractPool    │────►│  text_queue  │
-                             │ (ProcessPool)   │     │              │
-                             └─────────────────┘     └──────┬───────┘
-                                                             │
-                             ┌─────────────────┐            ▼
-                             │ ConcurrentEmbed │◄───────────┘
-                             │ (GPU batching)  │
-                             └────────┬────────┘
-                                      │
-                             ┌────────▼────────┐     ┌──────────────┐
-                             │  embed_queue    │────►│    WRITER    │
-                             │                 │     │ (store-only) │
-                             └─────────────────┘     └──────┬───────┘
-                                                             │
-                                                             ▼
-                                                  ┌──────────────────┐
-                                                  │ SQLite + Qdrant  │
-                                                  │ + document_texts │
-                                                  └──────────────────┘
-
-STAGE 2: POST-PROCESSING (deferred scoring)
-
-    ┌──────────────────┐     ┌──────────────┐     ┌──────────────┐
-    │ document_texts   │────►│PostProcessor │────►│   Update DB  │
-    │ (unscored batch) │     │ Score+Dedup  │     │ quality_score│
-    └──────────────────┘     │  +FPS (opt)  │     │ wilson_score │
-                             └──────────────┘     └──────────────┘
-
-STAGE 1 COMPONENTS:
-
-    PRODUCER (single process):
-        1. Read dump file sequentially
-        2. Apply URL pattern filters (moved from worker)
-        3. Check Bloom filter for already-processed URLs
-        4. Push valid URLs to url_queue
-        5. No decisions beyond filtering
-
-    ASYNC FETCHER (event loop, aiohttp):
-        1. Pull URL from url_queue
-        2. Async HTTP fetch (concurrency: 100)
-        3. Optional playwright for JavaScript-heavy sites (concurrency: 4)
-        4. 15s timeout, exponential backoff
-        5. Push (url, html) to html_queue
-
-    EXTRACT POOL (ProcessPoolExecutor, 8 workers):
-        1. Pull (url, html) from html_queue
-        2. Extract text with trafilatura (CPU-bound)
-        3. Compute raw_html_hash for provenance
-        4. Language + length filters
-        5. Push (url, text, metadata, hash) to text_queue
-        6. Module-level _extract_worker_fn for pickling
-
-    CONCURRENT EMBEDDER (GPU batching, batch_size=256):
-        1. Pull batch of texts from text_queue
-        2. Compute embeddings with bge-small on MPS/CUDA
-        3. OOM protection: auto-reduce batch_size on errors
-        4. Push (url, embedding, text, metadata, hash) to embed_queue
-
-    WRITER (single process, store-only):
-        1. Only process that writes to databases
-        2. Pull from embed_queue
-        3. Generate document ID: SHA256(canonical_url)[:16]
-        4. Write to documents (quality_profile_used='pending')
-        5. Write to document_texts (for deferred scoring)
-        6. Write vector to Qdrant
-        7. Archive parsed content to compressed JSONL
-        8. No scoring, no FPS, no dedup at this stage
-        9. No locks needed: single-threaded entry point
-
-STAGE 2 COMPONENTS:
-
-    POSTPROCESSOR (batch processing):
-        1. Query unscored documents (quality_profile_used='pending')
-        2. Load full text from document_texts table
-        3. Detect content type (scientific, code, essay, etc.)
-        4. Compute quality scores with calibrated weights
-        5. Compute Wilson scores (sample-size-aware confidence)
-        6. Run SimHash deduplication
-        7. Optional: Run FPS selection
-        8. Update documents table with scores and status
-        9. Process in batches (default: 1000 docs/batch)
-  
-TWO-STAGE BENEFITS:
-
-    Stage 1 (Ingestion):
-        - **10x writer throughput:** No scoring bottleneck (~1200 docs/sec vs ~500)
-        - **Async I/O:** aiohttp saturates network, playwright handles JS sites
-        - **Multiprocess extraction:** Saturates all CPU cores
-        - **Fault tolerance:** Text preserved even if scoring crashes
-        - **No locks:** Single-writer architecture, no coordination overhead
-
-    Stage 2 (Post-Processing):
-        - **Re-scorable:** Update weights without re-crawling
-        - **A/B testable:** Compare scoring algorithms on same corpus
-        - **Debuggable:** Clear separation, easier to isolate scoring bugs
-        - **Flexible:** Run FPS optionally, adjust quality thresholds
-
-    Overall:
-        - No mutexes, no race conditions, no distributed coordination
-        - Natural backpressure via queue sizes
-        - Crash recovery: resume from queue state
-        - Simpler debugging: stages isolated
-
-QUEUE SIZING:
-    url_queue: 10,000 items (memory ~1MB)
-    html_queue: 5,000 items (memory ~500MB raw HTML)
-    text_queue: 5,000 items (memory ~50MB extracted text)
-    embed_queue: 5,000 items (memory ~50MB vectors + metadata)
-
-CONFIGURATION (config.json):
-    "batch_processing": {
-        "fetch_concurrency": 100,         // Async HTTP concurrency
-        "fetch_timeout": 15,              // Seconds
-        "use_playwright": false,          // Enable for JS sites
-        "playwright_concurrency": 4,      // Browser pool size
-        "extract_processes": 8,           // CPU cores for extraction
-        "skip_scoring": true,             // Must be true for new pipeline
-        "skip_url_filter": true,          // Filter in producer instead
-        "url_queue_size": 10000,
-        "embed_queue_size": 5000
-    }
+┌─────────────────────────────────────────────────────────────────────┐
+│              STAGE 1: INGESTION (CPU I/O → GPU embed → store)      │
+│                                                                     │
+│  Producer ──► url_queue ──► AsyncFetcher ──► html_queue            │
+│                                                  │                  │
+│  ExtractPool(trafilatura) ◄──────────────────────┘                 │
+│       │                                                             │
+│  Arrow shared memory ──► GPU Embedder(PyTorch) ──► embed_queue     │
+│                                                        │            │
+│  Writer(Parquet + Qdrant + SQLite + Meilisearch) ◄─────┘           │
+├─────────────────────────────────────────────────────────────────────┤
+│              STAGE 2: GPU POST-PROCESSING (all on GPU)             │
+│                                                                     │
+│  Load embeddings → tensor_ops.score() → tensor_ops.find_duplicates │
+│  → tensor_ops.project_2d() → tensor_ops.cluster()                  │
+│  → Export Parquet/Arrow for visualizer                              │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-**Implementation (Stage 1 - Ingestion):**
+### 4.4 Stage 1: Ingestion
+
+**CPU-bound components** (I/O and DOM parsing — cannot move to GPU):
+
+**Producer:** Reads dump via `SourceFunctor`. Filters URLs, deduplicates against existing DB. Pushes to `url_queue`.
+
+**AsyncFetcher:** aiohttp event loop. Concurrency from `config.json → batch_processing.fetch_concurrency`. Optional playwright for JS sites.
+
+**ExtractPool:** ProcessPoolExecutor with trafilatura (`favor_recall=True`, `include_tables=True`). Post-extraction cleanup strips artifacts. This is the only multiprocess CPU component — DOM parsing is inherently recursive and cannot be GPU-accelerated. Hand-off to GPU via Arrow shared memory buffers (not pickle).
+
+**GPU-bound components:**
+
+**Embedder:** PyTorch on MPS/CUDA. Model: `nomic-embed-text-v1.5` (8192 token context, Matryoshka representation for dynamic dimension resizing). Batch accumulation with OOM protection (auto-halve batch size).
+
+**Writer:** Single-threaded store-only. Writes to: SQLite (documents + document_texts), Qdrant (vectors via async batch), Parquet archive (compressed JSONL), Meilisearch (metadata index). All with `quality_profile_used='pending'`.
+
+**Memory Governor:** Background thread monitors RSS against `config.json → resource_limits.max_rss_gb`. Graceful shutdown on exceed.
+
+### 4.5 Stage 2: GPU Post-Processing
+
+Runs entirely on GPU. Operates on stored embeddings from Stage 1.
 
 ```
-RUN_BATCH_INGESTION(dump_path):
-    # Initialize queues
-    url_queue ← bounded_queue(max=10000)
-    html_queue ← bounded_queue(max=5000)
-    text_queue ← bounded_queue(max=5000)
-    embed_queue ← bounded_queue(max=5000)
+GPU_POST_PROCESS():
+    E ← load_embeddings_as_tensor()          # from Qdrant or .pt checkpoint
+    texts ← document_texts.get_unscored()    # CPU: text retrieval
 
-    # Start producer
-    PRODUCER:
-        FOR url IN read_dump(dump_path):
-            IF passes_filters(url) AND NOT in_bloom_filter(url):
-                url_queue.put(url)
+    // Scoring: weighted feature projection (single dot product, not per-doc loop)
+    features ← extract_features(texts)       # CPU: text analysis
+    F ← to_tensor(features, device='gpu')
+    scores ← tensor_ops.score(F, weight_vectors[content_type])
 
-    # Start async fetcher (event loop)
-    ASYNC FETCHER:
-        WHILE NOT shutdown:
-            url ← url_queue.get()
-            html ← await aiohttp.get(url, timeout=15)
-            IF html IS NULL: CONTINUE
-            html_queue.put((url, html))
+    // Wilson confidence: vectorized across entire corpus
+    wilson ← tensor_ops.wilson_score(positive_counts, total_counts)
 
-    # Start extract pool (ProcessPoolExecutor)
-    EXTRACT POOL (8 processes):
-        WHILE NOT shutdown:
-            (url, html) ← html_queue.get()
-            raw_html_hash ← sha256(html)
-            text, metadata ← trafilatura.extract(html)
-            IF len(text) < 100: CONTINUE
-            text_queue.put((url, text, metadata, raw_html_hash))
+    // Deduplication: GPU gram matrix
+    dup_mask ← tensor_ops.find_duplicates(E, threshold=0.95)
 
-    # Start embedder (GPU batching)
-    CONCURRENT EMBEDDER:
-        batch ← []
-        WHILE NOT shutdown OR text_queue.not_empty:
-            WHILE len(batch) < 256 AND text_queue.not_empty:
-                batch.append(text_queue.get())
-            embeddings ← model.encode([item.text for item in batch])
-            FOR item, embedding IN zip(batch, embeddings):
-                embed_queue.put((item.url, embedding, item.text,
-                                item.metadata, item.hash))
-            batch ← []
+    // Clustering: cuML HDBSCAN via DLPack (zero-copy from PyTorch)
+    coords_2d ← tensor_ops.project_2d(E)
+    labels ← tensor_ops.cluster(coords_2d)
 
-    # Start writer (single-threaded)
-    WRITER:
-        WHILE NOT shutdown OR embed_queue.not_empty:
-            (url, embedding, text, metadata, hash) ← embed_queue.get()
-            doc_id ← sha256(url)[:16]
-
-            # Store document (quality_profile_used='pending')
-            documents.insert(doc_id, url, metadata, quality_score=0.0)
-            document_texts.insert(doc_id, text)
-            qdrant.upsert(doc_id, embedding)
-            archive.write(url, text, metadata, hash)
+    // Update DB + export Arrow for visualizer
+    documents.batch_update(scores, wilson, labels, dup_mask)
+    export_arrow(coords_2d, labels, scores)   # zero-copy to deck.gl
 ```
 
-**CLI Usage:**
+### 4.6 Speed Characteristics
 
-```bash
-# Stage 1: Batch ingestion
-python -m phase1_offline.pipeline --dump dataset/sample.tar
-# Output: Documents with quality_profile_used='pending'
+| Component        | Throughput         | Bound     | GPU Migration Impact      |
+| ---------------- | ------------------ | --------- | ------------------------- |
+| Producer         | ~500K URLs/sec     | Disk I/O  | No change (CPU)           |
+| AsyncFetcher     | ~100 URLs/sec      | Network   | No change (CPU)           |
+| ExtractPool      | ~50 docs/sec       | CPU       | Stays CPU (DOM parsing)   |
+| Embedder         | ~1000+ docs/sec    | GPU       | Faster with larger model  |
+| Writer           | ~1200 docs/sec     | I/O       | Arrow buffers reduce copy |
+| **Post-process** | **Entire corpus**  | **GPU**   | **Batch, not per-doc**    |
 
-# Stage 2: Post-processing
-python scripts/post_process.py
-python scripts/post_process.py --batch-size 500 --quality-threshold 0.2
-# Output: Documents scored, deduplicated, optionally FPS-selected
-```
+---
 
-### 3.6 Speed Optimizations for Batch Processing
+## 5. Database Schema
 
-**Embedding computation (primary bottleneck):**
+### 5.1 Operational Tensor Store (GPU)
 
-| Optimization                 | Impact                                      |
-| ---------------------------- | ------------------------------------------- |
-| Batch size 256-512           | Saturates GPU/Neural Engine                 |
-| bge-small-en-v1.5 (384-dim)  | Fast + good quality                         |
-| MPS backend on M4            | ~1000 embeddings/sec                        |
-| Quantize immediately to int8 | 4x memory reduction, enables larger batches |
+Composite tensor loaded into VRAM for all math operations. Pre-allocate spare columns for schema evolution.
 
-**Embedding Model Strategy:**
+| Sub-tensor       | Shape           | Type    | Content                              |
+| ---------------- | --------------- | ------- | ------------------------------------ |
+| Embeddings       | (N, D)          | Float32 | Document embeddings (D=768 nomic)    |
+| Metadata IDs     | (N, M)          | Int64   | Encoded domain/topic/date IDs        |
+| Scores           | (N, S)          | Float32 | Quality, wilson, importance scores   |
+| Spare            | (N, 16-M-S)     | Float32 | Reserved for schema evolution        |
 
-Stick with `bge-small-en-v1.5` for the navigation/sampling layer. This model is:
+Checkpointed to `tensors/*.pt`. Micro-batched (10K rows) to survive OOM.
 
-- Well-tested and stable
-- Fast enough for batch processing
-- What the HNSW index is built around
+### 5.2 SQLite Tables
 
-If better semantic understanding is needed later, add a **reranker** (e.g., `bge-reranker-base`) that runs only on small result sets (top-100), rather than changing the base embedding model. Rerankers don't affect the index structure.
+Auto-created by `atlas_core` on startup. Path: `config.json → database.sqlite_path`.
 
-**Parallelization strategy (producer-consumer):**
+**documents** — Primary metadata table.
 
-```
-Producer (read dump)     ████
-url_queue fills          ════════════════════════════════════════
-Workers (fetch+embed)    ████████████████████████████████████████
-embed_queue fills        ════════════════════════════════════════
-Writer (FPS+score+write) ████████████████████████████████████████
+| Column                | Type      | Key         | Description                                |
+| --------------------- | --------- | ----------- | ------------------------------------------ |
+| id                    | TEXT      | PK          | SHA256(canonical_url)[:16]                 |
+| canonical_url         | TEXT      | UNIQUE NN   | Normalized URL                             |
+| title, author         | TEXT      |             | Extracted metadata                         |
+| domain                | TEXT      | NN          | From URL                                   |
+| content_hash          | TEXT      | NN          | SimHash (64-bit hex)                       |
+| content_length        | INTEGER   |             | Character count                            |
+| language              | TEXT      |             | ISO 639-1                                  |
+| detected_content_type | TEXT      |             | scientific, technical_code, essay, news, docs, other |
+| quality_score         | REAL      |             | 0–1                                        |
+| wilson_score          | REAL      |             | Sample-size-aware confidence               |
+| importance_score      | REAL      |             | Z-axis (domain authority)                  |
+| cluster_id            | INTEGER   |             | HDBSCAN label (-1 = noise)                 |
+| quality_profile_used  | TEXT      |             | 'pending' or 'scored'                      |
+| source_phase          | TEXT      |             | batch_dump / active_exploration            |
+| source_dump           | TEXT      |             | Which dump file                            |
+| status                | TEXT      |             | active, duplicate, rejected                |
+| raw_html_hash         | TEXT      |             | SHA256 of original HTML                    |
+| created_at            | TIMESTAMP | DEFAULT NOW |                                            |
+| updated_at            | TIMESTAMP | DEFAULT NOW |                                            |
 
-- Producer is fast, fills queue early
-- Workers are I/O bound, benefit from high concurrency (12-16 threads)
-- Writer is single-threaded but fast (FPS is O(log n) per document)
-- Queues provide natural backpressure
-- No coordination overhead between workers
-```
+**document_texts** — Full text for deferred scoring. `(doc_id TEXT PK FK, text TEXT NN)`
 
-## 5. Data Models
+**url_queue** — Processing queue. `(canonical_url TEXT PK, original_url TEXT NN, status TEXT DEFAULT 'pending', source TEXT NN, priority REAL DEFAULT 0.5, retry_count INTEGER DEFAULT 0, ...timestamps)`
 
-### 5.1 Core Entities
+**dump_processing_jobs** — Job audit trail. `(id TEXT PK, dump_name TEXT NN, total_urls, filtered_urls, extracted/embedded/accepted/rejected counts, status, ...timestamps)`
 
-#### 5.1.1 QueuedURL
+**golden_set** — Calibration exemplars. `(id INTEGER PK, url TEXT UNIQUE, label TEXT, content_type, domain, raw_metrics JSON, version INTEGER)`
 
-Represents a URL discovered but not yet processed.
+**coverage_metrics** — Atlas health snapshots. `(topic_gini, domain_gini, orphan_rate, cluster_count, largest_cluster_pct)`
 
-| Field               | Type      | Constraints                                      | Description                           |
-| ------------------- | --------- | ------------------------------------------------ | ------------------------------------- |
-| canonical_url       | TEXT      | PRIMARY KEY                                      | Normalized URL                        |
-| original_url        | TEXT      | NOT NULL                                         | URL as discovered                     |
-| status              | ENUM      | pending, processing, completed, failed, rejected | Processing state                      |
-| source_phase        | ENUM      | batch_dump, active_exploration                   | Which phase discovered this           |
-| source              | TEXT      | NOT NULL                                         | Source identifier (dump name, gap ID) |
-| source_metadata     | JSON      |                                                  | Source-specific data                  |
-| priority            | REAL      | DEFAULT 0.5                                      | Processing priority (0-1)             |
-| discovered_at       | TIMESTAMP | NOT NULL                                         | When URL entered queue                |
-| claimed_by          | TEXT      |                                                  | Worker ID if processing               |
-| claimed_at          | TIMESTAMP |                                                  | When processing started               |
-| completed_at        | TIMESTAMP |                                                  | When processing finished              |
-| retry_count         | INTEGER   | DEFAULT 0                                        | Number of failed attempts             |
-| error_message       | TEXT      |                                                  | Last error if failed                  |
-| parsed_archive_path | TEXT      |                                                  | Path to stored parsed content         |
+**cluster_stats** — HDBSCAN cluster characteristics. `(cluster_id INTEGER NN, doc_count, avg_quality, quality_std, is_content_farm, is_authority)`
 
-#### 5.1.2 Document
+**detected_gaps** / **exploration_provenance** — Phase 2, not yet active.
 
-Represents a processed, accepted document in the atlas.
+### 5.3 Qdrant Collection
 
-| Field                 | Type      | Constraints      | Description                                                            |
-| --------------------- | --------- | ---------------- | ---------------------------------------------------------------------- |
-| id                    | TEXT      | PRIMARY KEY      | SHA256(canonical_url)[:16]                                             |
-| canonical_url         | TEXT      | UNIQUE, NOT NULL | Normalized URL                                                         |
-| original_urls         | JSON      |                  | Array of all URLs that resolved to this                                |
-| title                 | TEXT      |                  | Extracted title                                                        |
-| summary               | TEXT      |                  | Generated/extracted summary                                            |
-| content_hash          | TEXT      | NOT NULL         | SimHash of content (64-bit hex)                                        |
-| minhash_signature     | BLOB      |                  | MinHash signature for near-duplicate LSH (128 hashes)                  |
-| content_length        | INTEGER   |                  | Character count                                                        |
-| language              | TEXT      |                  | ISO 639-1 code                                                         |
-| author                | TEXT      |                  | Extracted author                                                       |
-| publication_date      | DATE      |                  | Extracted or inferred date                                             |
-| domain                | TEXT      | NOT NULL         | Extracted from URL                                                     |
-| source_phase          | ENUM      |                  | batch_dump, active_exploration                                         |
-| source_dump           | TEXT      |                  | If batch: which dump                                                   |
-| source_gap_id         | TEXT      |                  | If exploration: which gap triggered discovery                          |
-| source_gap_type       | TEXT      |                  | If exploration: "topic" or "viewpoint"                                 |
-| source_query          | TEXT      |                  | If exploration: the query that found this document                     |
-| detected_content_type | ENUM      |                  | scientific, technical_code, personal_essay, news, documentation, other |
-| quality_score         | REAL      | 0-1              | Current active quality score                                           |
-| quality_score_version | INTEGER   | DEFAULT 1        | Version of scoring algorithm used                                      |
-| quality_components    | JSON      |                  | Breakdown of quality signals (enables recomputation)                   |
-| quality_profile_used  | TEXT      |                  | Which scoring profile was applied                                      |
-| wilson_score          | REAL      | 0-1              | Sample-size-aware quality confidence (see Section 6.3.2)               |
-| cluster_id            | INTEGER   |                  | HDBSCAN cluster assignment (-1 = orphaned)                             |
-| importance_score      | REAL      | 0-1              | Domain authority score for Z-axis                                      |
-| epistemic_profile     | JSON      |                  | claim_type, stance, quality breakdown                                  |
-| created_at            | TIMESTAMP | NOT NULL         | When added to atlas                                                    |
-| updated_at            | TIMESTAMP |                  | Last modification                                                      |
+| Property         | Value                              |
+| ---------------- | ---------------------------------- |
+| Collection       | `atlas_embeddings`                 |
+| Vector dimension | 768 (nomic-embed-text-v1.5)        |
+| Distance metric  | Cosine                             |
+| Quantization     | Scalar (int8)                      |
+| Storage          | On-disk (memory-mapped)            |
 
-#### 5.1.3 DetectedGap (ignore, for the later active phase)
+### 5.4 Meilisearch Index
 
-Tracks gaps identified during exploration.
+`atlas_documents` — searchable fields: title, domain, url. Results limit: 20.
 
-#### 5.1.4 ExplorationProvenance (ignore, for the later active phase)
-
-#### ~~5.1.5 GoldenSetEntry~~
-
-~~Manually curated examples for weight calibration.~~
-
-#### 5.1.6 ClusterStats
-
-Tracks HDBSCAN cluster characteristics over time.
-
-| Field           | Type      | Constraints | Description                           |
-| --------------- | --------- | ----------- | ------------------------------------- |
-| id              | INTEGER   | PRIMARY KEY | Auto-increment                        |
-| cluster_id      | INTEGER   | NOT NULL    | HDBSCAN cluster label (-1 = orphaned) |
-| computed_at     | TIMESTAMP | NOT NULL    | When stats were computed              |
-| doc_count       | INTEGER   |             | Number of documents in cluster        |
-| avg_quality     | REAL      |             | Mean quality score                    |
-| quality_std     | REAL      |             | Quality standard deviation            |
-| is_content_farm | BOOLEAN   |             | Flagged as potential content farm     |
-| is_authority    | BOOLEAN   |             | Flagged as authoritative cluster      |
-| action_taken    | TEXT      |             | What action was taken (if any)        |
+---
 
 ## 6. Module Specifications
 
-### 6.1 Batch Sampler Module
+All modules import from `atlas_core`. No module contains its own math, config loading, or logging — those live in the core.
 
-**Responsibility:** Process dumps using producer-consumer pipeline with farthest-point sampling for maximum coverage.
+### 6.1 Phase 1 Offline (`phase1_offline/`)
 
-**Interface:**
+Two-stage batch pipeline. See Section 4 for full workflow.
 
-```
-CLI: ./batch-sample [OPTIONS]
+| File                | Purpose                                      |
+| ------------------- | -------------------------------------------- |
+| `pipeline.py`       | Orchestrator, queues, threads                |
+| `producer.py`       | Dump reading via `SourceFunctor`             |
+| `worker.py`         | AsyncFetcher, ExtractPool, GPU Embedder      |
+| `writer.py`         | Writer + BatchWriter (store-only)            |
+| `dump_adapters.py`  | `SourceFunctor` implementations (SLOP)       |
+| `deduplication.py`  | Calls `tensor_ops.find_duplicates`           |
+| `fps_sampler.py`    | Calls `tensor_ops.farthest_point_sample`     |
+| `post_processor.py` | Stage 2 GPU post-processing orchestrator     |
 
-Options:
-  --dump PATH             Path to dump file (JSON/JSONL/CSV)
-  --dump-type TYPE        Type of dump (marginalia, dmoz, pinboard, hn, custom)
-  --budget N              Maximum documents to select from this dump
-  --quality-weight FLOAT  α parameter for quality weighting (default: 1.0)
-  --workers N             Number of worker threads (default: 12)
-  --dry-run               Analyze dump without processing
-  --resume                Resume interrupted job
-  --recrawl PATH          Re-crawl specific URLs from file (for extraction fixes)
-  --wayback-sample N      Sample N URLs from Wayback Machine (for extractor experiments)
-  --extractor NAME        Content extractor to use (default: trafilatura)
+### 6.2 Storage (`storage/`)
 
-Environment:
-  ATLAS_DB_PATH           Path to atlas databases
-  QDRANT_URL              Qdrant server URL
-  PARSED_ARCHIVE_PATH     Path for parsed content storage
-```
+| File               | Purpose                                      |
+| ------------------ | -------------------------------------------- |
+| `atlas_store.py`   | Unified SQLite + Qdrant query interface      |
+| `parquet_store.py` | Parquet/Arrow for mappings and bulk exports   |
 
-**Processing Stages:**
+Arrow format enables zero-copy transfer: GPU tensor → Arrow buffer → deck.gl WebGL. Bypasses JSON serialization entirely.
 
-```
-1. PRODUCER: LOAD AND PRE-FILTER
-   - Parse dump file
-   - Apply URL pattern filters
-   - Check Bloom filter for processed URLs
-   - Push to url_queue
+### 6.3 Curator (`curation/scoring/`)
 
-2. WORKERS: FETCH, EXTRACT, EMBED (parallel, N threads)
-   - Fetch content (I/O bound)
-   - Extract main content immediately (trafilatura + fallbacks)
-   - Compute raw_html_hash for provenance
-   - Language filter (English only)
-   - Length filter (100-100K chars)
-   - Compute embedding
-   - Push to embed_queue
-
-3. WRITER: SAMPLE, SCORE, ACCEPT (single-threaded, no locks)
-   - Lazy greedy FPS selection
-   - Novelty check against global index
-   - Compute quality score using calibrated weights
-   - Compute Wilson score for confidence-aware ranking
-   - If accepted: add to atlas, archive parsed content
-```
-
-### 6.3 Curator Module
-
-**Responsibility:** Score documents using Golden Set calibrated weights, detect duplicates, accept or reject.
-
-**Interface:**
+Scores documents using protocol-based metrics. **GPU migration:** scoring becomes a single dot product of feature matrix × weight vector, replacing per-document iteration.
 
 ```
-CLI: ./curate [OPTIONS]
-
-Options:
-  --pending               Process documents with status='pending_curation'
-  --recompute-scores      Recompute scores for all documents (new version)
-  --recompute-wilson      Recompute Wilson scores after signal updates
-  --score-version N       Target score version for recomputation
-  --document-id ID        Process specific document
-  --verbose               Print detailed scoring breakdown
-
-Environment:
-  ATLAS_DB_PATH           Path to atlas databases
-  QDRANT_URL              Qdrant server URL
+curation/scoring/
+├── pipeline.py       # ScoringPipeline orchestrator
+├── protocols.py      # ScoringMetric protocol (from atlas_core)
+├── registry.py       # MetricRegistry for runtime discovery
+├── detection.py      # Content type detection
+├── aggregation.py    # GPU: tensor_ops.score() + tensor_ops.wilson_score()
+└── metrics/          # citation, depth, methodology, reputation,
+                      # specificity, structure, writing
 ```
 
-**Content Type Detection:**
+**Scoring flow:**
 
-| Content Type   | Domain Patterns                      | Content Signals                              |
-| -------------- | ------------------------------------ | -------------------------------------------- |
-| scientific     | arxiv.org, *.edu, pubmed, nature.com | "abstract", "methodology", "references", DOI |
-| technical_code | github.com, *.dev, stackoverflow.com | code blocks, "function", "class", "import"   |
-| personal_essay | *.substack.com, medium.com/@*      | first-person, "my experience", "personally"  |
-| news           | known news domains                   | "reported", "according to", "sources say"    |
-| documentation  | docs.*, *.readthedocs.io             | "## Installation", "API", "Parameters"       |
-| other          | fallback                             | —                                           |
+```
+SCORE_BATCH(texts, metadata):
+    raw_metrics ← registry.compute_all(texts)         # per-metric CPU
+    F ← to_tensor(raw_metrics)                         # CPU → GPU
+    content_types ← detect_types(texts, metadata)
+    scores ← tensor_ops.score(F, weights[content_types])   # GPU dot product
+    wilson ← tensor_ops.wilson_score(F)                     # GPU vectorized
+    RETURN scores, wilson, content_types
+```
 
-#### ~~6.3.1 Golden Set Weight Calibration with Topic-Cluster Cross-Validation~~
+**Content-type weights:**
 
-~~**Do not guess scoring weights.** Calibrate them empirically using a Golden Set.~~
+| Content Type   | Threshold | Top Weights                                          |
+| -------------- | --------- | ---------------------------------------------------- |
+| scientific     | 0.50      | citation (0.28), methodology (0.24), peer_review (0.22) |
+| technical_code | 0.45      | code_quality (0.27), recency (0.23), completeness (0.21) |
+| personal_essay | 0.40      | writing (0.32), specificity (0.26), authenticity (0.18) |
+| news           | 0.50      | attribution (0.31), perspectives (0.24), factual (0.21) |
+| documentation  | 0.45      | completeness (0.32), accuracy (0.26), recency (0.18) |
 
-~~**Critical insight from cartographic validation:** Standard random cross-validation overfits by 28-40% due to topical autocorrelation—pages from the same domain or topic cluster aren't independent. Use topic-cluster CV instead.~~
+**Calibration (future):** Replace scikit-learn logistic regression with single-layer PyTorch neural network — keeps entire pipeline in GPU memory.
 
-#### ~~6.3.2 Wilson Score for Hidden Gem Ranking~~
+**Deduplication:** `tensor_ops.find_duplicates(E, threshold)` on GPU. Replaces CPU SimHash/MinHash.
 
-~~**Problem:** Raw quality scores don't account for signal reliability. A page with 3 quality signals all positive (3/3 = 100%) should rank lower than a page with 50/55 positive signals (91%), because we have more confidence in the second estimate.~~
+### 6.4 Mapper (`mapping/`)
 
-~~**Solution:** Wilson score confidence interval gives a sample-size-aware lower bound on quality.~~
+Transforms embeddings into visual coordinates. **GPU migration:** UMAP via cuML (DLPack zero-copy from PyTorch), HDBSCAN via cuML.
 
-~~**Storage:** Wilson score stored in `documents.wilson_score` field, recomputed when quality components change.~~
+```
+mapping/
+├── pipeline.py       # MappingPipeline orchestrator
+├── protocols.py      # Projector, Clusterer, AxisScorer (from atlas_core)
+├── projectors.py     # UMAPProjector (future: cuML GPU)
+├── clusterers.py     # HDBSCANClusterer (future: cuML GPU)
+└── axis_scorers.py   # DomainAuthorityAxisScorer
+```
 
-#### 6.3.3 Importance Scoring (Z-axis for visualization)
+**Flow:**
 
-Compute importance score from: domain_authority (0.5 weight), inbound_links (0.3), academic_citations (0.2). Provides Z-axis in Atlas visualization.
+```
+COMPUTE_MAPPING():
+    E ← load_embeddings()
+    coords_2d ← projector.fit_transform(E)          # UMAP
+    labels ← clusterer.fit_predict(coords_2d)        # HDBSCAN
+    z_scores ← axis_scorer.score_batch(documents)    # importance
+    export_arrow(coords_2d, labels, z_scores)         # zero-copy to viz
+```
 
-#### 6.3.4 Deduplication (SimHash + MinHash)
+**Output:** Arrow binary blob consumed directly by deck.gl WebGL buffer. JSON fallback for compatibility. Parquet for analysis.
 
-| Method          | Threshold      | Purpose                                |
-| --------------- | -------------- | -------------------------------------- |
-| SimHash         | Hamming ≤ 3   | Exact duplicates                       |
-| MinHash LSH     | Jaccard ≥ 0.5 | Near-duplicates (128 hashes, 32 bands) |
-| Embedding       | Cosine ≥ 0.95 | Semantic duplicates                    |
-| Content overlap | ≥ 0.80        | Fallback                               |
+Config: `config.json → mapping` (umap.neighbors, umap.min_dist, umap.metric, hdbscan.min_cluster_size, sample_for_fit, output_path).
 
-#### 6.3.5 Domain-Adaptive Scoring Profiles
+### 6.5 Visualizer (`visualizer/`)
 
-Weights calibrated via Golden Set with topic-cluster CV (200 exemplary + 200 garbage per type).
+Interactive deck.gl WebGL visualization. **GPU migration:** Arrow binary blobs feed directly into ScatterplotLayer — no JSON serialization bottleneck.
 
-| Content Type   | Quality Thresh | Top Weights (calibrated)                                                        | Validation QADI |
-| -------------- | -------------- | ------------------------------------------------------------------------------- | --------------- |
-| scientific     | 0.50           | citation_quality (0.28), methodology (0.24), peer_review (0.22)                 | 0.18            |
-| technical_code | 0.45           | code_quality (0.27), recency (0.23), completeness (0.21)                        | 0.21            |
-| personal_essay | 0.40           | writing_quality (0.32), specificity (0.26), authenticity (0.18)                 | 0.24            |
-| news           | 0.50           | source_attribution (0.31), multiple_perspectives (0.24), factual_density (0.21) | 0.19            |
-| documentation  | 0.45           | completeness (0.32), accuracy (0.26), recency (0.18)                            | 0.22            |
-| default        | 0.45           | content_depth (0.22), source_signals (0.20), citation_quality (0.18)            | 0.25            |
+```
+Browser (deck.gl + Arrow)      Python Server (http.server)
+┌──────────────────┐           ┌──────────────────────────┐
+│ ScatterplotLayer │ ──REST──► │ AtlasAPIHandler          │
+│ OrthographicView │           │   /api/stats             │
+│ Arrow WebGL buf  │           │   /api/mappings (Arrow)  │
+│ LineLayer        │           │   /api/documents         │
+└──────────────────┘           │   /api/clusters/:id      │
+                               │   /api/search            │
+                               └──────────────────────────┘
+```
 
-**~~Score Versioning:~~**
+**Rendering:** ScatterplotLayer renders UMAP coordinates. Color = cluster ID. Size = importance (Z-axis). LineLayer for intra-cluster connections (togglable).
 
-~~When scoring weights change (after recalibration), increment `quality_score_version` and recompute:~~
+**Interactivity:** Scroll zoom, drag pan, click-to-open URL, hover tooltip, sidebar cluster filter, quality slider, content type dropdown, mapping selector, Meilisearch full-text search with GPU-based dimming of non-matches.
 
-#### ~~6.3.6 Epistemic Classification~~
+**API:** `/api/stats`, `/api/mappings`, `/api/mapping-list`, `/api/documents`, `/api/documents/{id}`, `/api/clusters`, `/api/clusters/{id}`, `/api/search?q=X`.
 
-### 6.4 Mapper Module
-
-**Responsibility:** Compute visualization coordinates, track diversity metrics. Use cosine similarity for all computation; reserve hyperbolic projection for display only.
-
-**Mapping Configuration:**
-
-| Component             | Method               | Key Parameters                                                 |
-| --------------------- | -------------------- | -------------------------------------------------------------- |
-| Semantic (XY)         | UMAP                 | neighbors=15, min_dist=0.1, metric=cosine, sample_for_fit=100K |
-| Importance (Z)        | domain authority     | source=importance_score from curator                           |
-| Topic clusters        | HDBSCAN              | min_cluster_size=50, cluster_selection_method=eom              |
-| Hyperbolic (viz only) | Poincaré projection | For display only, not indexing                                 |
+Config: `config.json → visualizer` (host, port, static_dir, dot_radius, connection_*).
 
 ---
 
-## 9. Development Phases
+## 7. Common Module (`common/`)
 
-### Phase 1: Foundation (Week 1)
+Shared infrastructure. Being gradually absorbed into `atlas_core` — new code should import from core where possible.
 
-- Directory structure and configuration
-- URL canonicalization with tests
-- SimHash + MinHash computation with tests
-- SQLite schema (including Golden Set, Wilson score, cluster fields)
-- Qdrant connection with quantization
-- T9 SSD mount and tiered storage
-- Parsed content archive infrastructure
+| File                    | Purpose                                          |
+| ----------------------- | ------------------------------------------------ |
+| `database.py`           | SQLite connection manager, schema init           |
+| `repositories.py`       | DocumentRepository, DocumentTextRepository, etc. |
+| `models.py`             | Type-safe dataclasses                            |
+| `qdrant_manager.py`     | Qdrant client wrapper, health checks             |
+| `meilisearch_manager.py`| Meilisearch client, graceful degradation         |
 
-### Phase 2: Batch Pipeline (Week 2)
+Thread safety: repositories open per-method connections. Absolute path resolution prevents CWD issues.
 
-- **Producer-consumer pipeline** (no multi-agent)
-- Pre-filtering in producer
-- Worker threads for fetch/extract/embed
-- Single-threaded writer for FPS/score/accept
-- **Content extraction with trafilatura** (extract-first, no HTML storage)
-- bge-small embedding computation
-- **Lazy greedy farthest-point sampling**
-- Process first dump (Marginalia blogs)
+---
 
-### Phase 3: Scoring and Curation (Week 3)
+## 8. GPU-Native Capabilities (Future)
 
-- Content type detection
-- **Build Golden Set (200 exemplary + 200 garbage per type)**
-- **Topic-cluster CV for calibration** (prevents 28-40% overfit)
-- **Calibrate weights via logistic regression**
-- **QADI metrics for validation** (quantity vs allocation diagnosis)
-- **Wilson score computation** (sample-size-aware ranking)
-- Domain-adaptive quality scoring with calibrated weights
-- **Importance scoring (domain authority)**
-- Epistemic classification
-- **MinHash LSH deduplication**
-- Full curation pipeline
-- Basic visualizer (list view with filters)
+Enabled by the linear algebra engine, not possible in the CPU version:
 
-### Phase 4: Active Exploration (Week 4)
+**Truth Tensor:** Train a linear probe on embeddings to project onto a "Consensus vs. Dissent" axis — quantifiable epistemic stance metric.
 
-- **Lonely node gap detection**
-- **HDBSCAN clustering** (quality topology, content farm detection)
-- Query inversion (keyword + LLM methods)
-- Search API integration (Marginalia, Kagi)
-- **Exploration provenance tracking**
-- Exploration cycle implementation
-- Exploration effectiveness tracking
+**Dynamic Focus:** Attention masks \( \text{Softmax}(E \cdot q) \) dynamically re-weight quality scores based on user queries. The atlas "morphs" ranking criteria in real-time.
 
-### Phase 5: Mapping and Visualization (Week 5)
-
-- Semantic mapping (UMAP, **cosine metric**)
-- **Hyperbolic mapping (visualization only)**
-- **Importance Z-axis**
-- Full visualizer (map view, filters, search)
-- Diversity overlays
-
-### Phase 6: Monitoring and Hardening (Week 6+)
-
-- **Coverage Gini tracking** (topic and domain equity)
-- **Cluster health monitoring**
-- **Drift detection** (QADI comparison over time)
-- Error handling and recovery
-- Content extraction fallback testing
-- Monitoring and metrics dashboard
-- Backup and restore
-- Documentation
-- First verification cycle
-- **Golden Set calibration validation**
-- Scale testing (10M documents)
+**Micro-batching:** Process 10K rows at a time. VRAM is a cache over Parquet storage — OOM crashes don't wipe state.
 
 ---
 
 ## Appendix A: Configuration Reference
 
-**Paths:** `data_dir`, `logs_dir`, `dumps_dir`, `archive_dir`, `parsed_archive_dir` → /Volumes/T9/atlas/...
+All configuration in `config.json`. Access: `atlas_core.config.get("section.key")`.
 
-**Databases:** url_queue, documents, graph, events, exploration, parsed_content, golden_set, coverage_metrics, cluster_stats (all SQLite in data_dir)
-
-**Qdrant:** url=localhost:6333, collection=atlas_embeddings, quantization=scalar, on_disk=true
-
-**Embedding:** model=bge-small-en-v1.5, device=mps, batch_size=256, max_tokens=512
-
-**LLM:** provider=openai, model=gpt-4o-mini, temperature=0.7
-
-**Batch Processing:** workers=12, quality_weight_alpha=1.0, novelty_threshold=0.08, queues=(url:10K, embed:5K), lazy_greedy=true
-
-**Content Extraction:** extractor=trafilatura, fallback=readability, store_raw_html_hash=true
-
-**Exploration:** topic_gaps(lonely_nodes, samples=1000, threshold=0.20, gaps=10), viewpoint_gaps(5, diversity=0.3), hdbscan(min_cluster_size=50), query_synthesis(llm, 5/gap), cycle=6h
-
-**Calibration:** golden_set_path, current_version=1, holdout=0.2, cv_method=topic_cluster, validation_metric=qadi
-
-**Scoring:** wilson_z=1.96, min_signals_for_ranking=3
-
-**Deduplication:** simhash≤3, minhash(128 hashes, 32 bands, Jaccard≥0.5), embedding≥0.95
-
-**Mapping:** UMAP(neighbors=15, min_dist=0.1, cosine), hyperbolic(display-only, depth=6)
-
-**Monitoring:** gini_alert_threshold=0.6, orphan_review_threshold=100, drift_alert_delta=0.05
+| Section              | Key parameters                                                        |
+| -------------------- | --------------------------------------------------------------------- |
+| `paths`              | `data_dir`, `logs_dir`, `dumps_dir`, `archive_dir`, `parsed_archive_dir`, `exports_dir`, `mappings_dir` |
+| `database`           | `sqlite_path`                                                         |
+| `qdrant`             | `url`, `collection`, `quantization`, `on_disk`, `batch_size`, `write_queue_size` |
+| `meilisearch`        | `url`, `api_key`, `index`, `search_results_limit`                     |
+| `embedding`          | `model` (nomic-embed-text-v1.5), `device`, `batch_size`, `max_tokens` |
+| `batch_processing`   | `default_dump`, `workers`, `worker_batch_size`, `url_queue_size`, `embed_queue_size`, `fetch_concurrency`, `fetch_timeout`, `extract_processes`, `quality_weight_alpha` |
+| `resource_limits`    | `max_rss_gb`, `check_interval_seconds`                                |
+| `content_extraction` | `extractor`, `fallback`, `min_length`, `max_length`                   |
+| `deduplication`      | `cosine_threshold` (replaces simhash/minhash thresholds)              |
+| `mapping`            | `umap.*`, `hdbscan.*`, `sample_for_fit`, `output_path`, `output_format` (arrow/json) |
+| `visualizer`         | `host`, `port`, `static_dir`, `dot_radius`, `connection_*`           |
+| `gpu`                | `device` (mps/cuda/cpu), `micro_batch_size`, `spare_columns`         |
 
 ---
 
-## Appendix B: Command Reference
+## Appendix B: Revision History
 
-| Command            | Key Options                                                                                                                     | Purpose                     |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------- | --------------------------- |
-| `./batch-sample` | `--dump`, `--dump-type`, `--budget`, `--workers`, `--resume`, `--recrawl`, `--wayback-sample`                     | Process dumps, re-extract   |
-| `./explore`      | `--detect-topic-gaps`, `--detect-viewpoint-gaps`, `--detect-clusters`, `--generate-queries`, `--execute`, `--cycle` | Gap detection & exploration |
-| `./calibrate`    | `--add-exemplary`, `--add-garbage`, `--compute-metrics`, `--train-weights`, `--validate`, `--qadi-report`           | Golden set management       |
-| `./curate`       | `--pending`, `--apply-weights`, `--recompute-scores`, `--recompute-wilson`, `--document-id`                           | Document scoring            |
-| `./map`          | `--type`, `--recompute`, `--incremental`                                                                                  | Generate mappings           |
-| `./visualize`    | `--port`, `--host`, `--static-export`                                                                                     | Serve web UI                |
-| `./orchestrate`  | `--batch-only`, `--explore-only`, `--continuous`                                                                          | Coordinate pipeline         |
-| `./stats`        | `--summary`, `--exploration-report`, `--calibration-drift`, `--qadi-history`                                            | Analytics                   |
-| `./monitor`      | `--compute-coverage`, `--compute-clusters`, `--drift-report`, `--full-report`                                           | Health monitoring           |
-| `./archive`      | `--compact`, `--verify`, `--stats`                                                                                        | Archive management          |
-| `./snapshot`     | `--output`                                                                                                                    | Backup atlas                |
-| `./verify`       | `--sample`, `--output`, `--compare-previous`, `--add-to-golden`                                                         | Quality verification        |
+| Version | Date     | Changes |
+| ------- | -------- | ------- |
+| 0.3–0.8 | Jan 2025 | Initial drafts through cartographic techniques integration |
+| 1.0.0   | Jan 2026 | MVP: batch pipeline, UMAP+HDBSCAN mapping, web visualizer |
+| 1.1.0   | Feb 2026 | Two-stage pipeline, repository pattern, protocol-based scoring/mapping, async fetcher, multiprocess extraction, GPU embedder with OOM protection |
+| 1.2.0–4 | Feb 2026 | Meilisearch search, mapping metadata enrichment, writer commit fix, extraction quality improvements, memory governor, async Qdrant batch writer |
+| 1.3.0   | Feb 2026 | Guide overhaul: consolidated Phase 1 workflow, full DB schema, detailed module specs, config.json references throughout |
+| 2.0.0   | Feb 2026 | **GPU-first architecture:** Hypergraph data model (sparse incidence matrix), category theory design patterns (functors, sheaves), two-universe storage (GPU tensors + Parquet/Arrow), core-library-first development (`atlas_core`), PyTorch tensor operations for scoring/dedup/clustering/projection, nomic-embed-text-v1.5 (8192 tokens), cuML GPU clustering via DLPack, zero-copy Arrow→deck.gl visualization, micro-batching fault tolerance. CPU retained only for HTTP fetching and HTML extraction. Document compacted ~35%. |
 
 ---
 
-## Appendix C: Revision History
+## Appendix C: Implementation Status
 
-| Version | Date     | Changes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| ------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 0.3.0   | Jan 2025 | Initial draft                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| 0.4.0   | Jan 2025 | Lake Pattern (HTML archival), HNSW strain gap detection, Lazy greedy FPS, MinHash deduplication, Importance scoring, Score versioning, Hyperbolic clarification, Provenance tracking                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| 0.5.0   | Jan 2025 | Producer-consumer pipeline (replaced multi-agent), Lonely node gap detection (replaced HNSW strain), Archive retention policy (quality-gated), Golden Set calibration (replaced manual weights)                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| 0.6.0   | Jan 2025 | Extract-first storage (replaced raw HTML archival with parsed content archive via trafilatura), 5x storage reduction, raw_html_hash for provenance                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| 0.7.0   | Jan 2025 | Replaced code snippets with concise pseudocode, condensed YAML configs to tables                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| 0.8.0   | Jan 2025 | **Cartographic techniques integration:** Topic-cluster cross-validation (prevents 28-40% overfit), QADI metrics (quantity vs allocation diagnosis), Wilson score ranking (sample-size-aware confidence), HDBSCAN clustering (quality topology, content farm detection, orphaned gem discovery), Coverage Gini coefficient (equity tracking), Monitor module, updated data models and CLI commands                                                                                                                                                                                                                                                      |
-| 1.0.0   | Jan 2026 | **MVP Implementation:** Complete batch pipeline (producer-consumer), UMAP+HDBSCAN mapping, interactive web visualizer, structured logging, modular scripts. See Appendix D for details.                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| 1.1.0   | Feb 2026 | **Architecture Refactoring:** Two-stage pipeline (ingestion + post-processing), Repository pattern for data access, Protocol-based scoring package (modular metrics), Protocol-based mapping package (swappable components), AsyncFetcher (aiohttp + playwright), ExtractPool (multiprocess extraction), ConcurrentEmbedder (GPU batching with OOM protection), document_texts table (deferred scoring), QdrantManager abstraction, Domain models with type safety, 10x writer throughput improvement                                                                                                                                                  |
-| 1.1.1   | Feb 2026 | **Refactoring:** Resume-safe Phase 1 (DB-backed URL dedup, resume flags), removed mock fetch/embedding paths, persisted source_dump metadata, added explicit existing-DB safety logging                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| 1.2.0   | Feb 2026 | **Meilisearch Full-Text Search:** Added Meilisearch as discrete service for full-text document search. MeilisearchManager (lazy-init, graceful degradation). Writer pipeline indexes metadata to Meilisearch alongside Qdrant embeddings. BatchWriter buffers Meilisearch writes. Search API endpoint (`/api/search/meili`). Frontend search bar overlaid on map (semi-transparent, left side). Search results dropdown with click-to-zoom. GPU-based dimming of non-matched points via ScatterplotLayer alpha channel (no point removal). Sidebar search results limit control. Backfill script (`scripts/meili_sync.py`) for existing documents. |
-| 1.2.1   | Feb 2026 | **Refactoring:** Enriched mapping metadata by doc_id, added metadata columns to Parquet mapping exports, and removed placeholder score defaults to surface missing data issues early.                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| 1.2.2   | Feb 2026 | **Writer Commit Fix + Text Storage:** Fixed missing `conn.commit()` in BatchWriter/Writer causing `document_texts` table to remain empty (0 rows for 38k docs). Removed `summary` computation from ingestion (leave empty; full text lives in `document_texts`). Added `scripts/backfill_texts.py` to populate `document_texts` from parsed archive for existing DB rows. PostProcessor scoring depends on `document_texts` for deferred scoring.                                                                                                                                                                                        |
-| 1.2.3   | Feb 2026 | **Extraction Quality:** Switched trafilatura to `favor_recall=True`, `include_tables=True`, `deduplicate=True` for complete content extraction. Added `_clean_extracted_text()` post-processor to strip code blocks, CSS/JS artifacts, cookie banners, nav lists, ad CTAs, and non-alphabetic lines. Applied to both `_extract_worker_fn` (ProcessPoolExecutor path) and `ContentExtractor.extract` (BatchWorker path).                                                                                                                                                                                                                    |
-| 1.2.4   | Feb 2026 | **Refactoring:** Added memory governor (18GB cap) that exits gracefully when exceeded. Qdrant writes moved to async batch worker to avoid writer stalls when Qdrant is unstable.                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+### Phase 1 Components (Complete — pre-GPU migration)
 
----
+| Component                    | Location                             | Status   |
+| ---------------------------- | ------------------------------------ | -------- |
+| Batch Ingestion (Stage 1)    | `phase1_offline/pipeline.py`         | Complete |
+| AsyncFetcher + ExtractPool   | `phase1_offline/worker.py`           | Complete |
+| ConcurrentEmbedder (MPS)     | `phase1_offline/worker.py`           | Complete |
+| Writer + BatchWriter         | `phase1_offline/writer.py`           | Complete |
+| Post-Processing (Stage 2)    | `phase1_offline/post_processor.py`   | Complete |
+| SLOP Dump Adapter            | `phase1_offline/dump_adapters.py`    | Complete |
+| Quality Scoring Package      | `curation/scoring/`                  | Complete |
+| SimHash + MinHash Dedup      | `phase1_offline/deduplication.py`    | Complete |
+| Repository Layer             | `common/repositories.py`             | Complete |
+| SQLite + Qdrant + Meilisearch| `common/`                            | Complete |
+| UMAP Mapping Pipeline        | `mapping/pipeline.py`                | Complete |
+| deck.gl Visualizer           | `visualizer/server.py`               | Complete |
+| Health Monitor               | `monitor/health.py`                  | Complete |
+| Parquet/Arrow Store          | `storage/`                           | Complete |
 
-## Appendix D: MVP Implementation Summary
+### Planned (GPU Migration)
 
-This appendix documents the actual implementation delivered in the initial MVP release.
+| Component                    | Priority | Notes                                          |
+| ---------------------------- | -------- | ---------------------------------------------- |
+| `atlas_core` library         | P0       | Build first — all modules depend on it         |
+| `tensor_ops.py`              | P0       | GPU scoring, dedup, FPS, projection primitives |
+| `hypergraph.py`              | P1       | Sparse incidence matrix construction           |
+| `functors.py`                | P1       | Base functor class for source adapters         |
+| nomic-embed-text-v1.5        | P1       | Replace bge-small, 8192 token context          |
+| GPU post-processor           | P1       | Replace CPU scoring loop with dot product      |
+| cuML HDBSCAN/UMAP            | P2       | DLPack zero-copy from PyTorch                  |
+| Arrow→deck.gl pipeline       | P2       | Zero-copy visualization, bypass JSON           |
+| Truth Tensor (epistemic)     | P3       | Linear probe on consensus/dissent axis         |
+| Dynamic Focus (attention)    | P3       | Query-dependent quality re-weighting           |
 
-### Implemented Components
+### Architecture Deviations from Original Guide
 
-| Component                           | Location                             | Status   | Notes                                        |
-| ----------------------------------- | ------------------------------------ | -------- | -------------------------------------------- |
-| **Batch Ingestion (Stage 1)** | `phase1_offline/pipeline.py`       | Complete | Two-stage architecture, async + multiprocess |
-| AsyncFetcher                        | `phase1_offline/worker.py`         | Complete | aiohttp + playwright for JS sites            |
-| ExtractPool                         | `phase1_offline/worker.py`         | Complete | Multiprocess CPU-bound extraction            |
-| ConcurrentEmbedder                  | `phase1_offline/worker.py`         | Complete | GPU batching with OOM protection             |
-| Writer (Store-Only)                 | `phase1_offline/writer.py`         | Complete | No scoring, writes to document_texts         |
-| **Post-Processing (Stage 2)** | `phase1_offline/post_processor.py` | Complete | Deferred scoring + dedup + FPS               |
-| SLOP Dump Adapter                   | `phase1_offline/dump_adapters.py`  | Complete | Marginalia archive format                    |
-| Content Extraction                  | `phase1_offline/worker.py`         | Complete | trafilatura + readability fallback           |
-| **Quality Scoring Package**   | `curation/scoring/`                | Complete | Modular, protocol-based, extensible          |
-| ScoringPipeline                     | `curation/scoring/pipeline.py`     | Complete | Orchestrates metrics + aggregation           |
-| Individual Metrics                  | `curation/scoring/metrics/`        | Complete | Citation, depth, methodology, etc.           |
-| Deduplication                       | `phase1_offline/deduplication.py`  | Complete | SimHash + MinHash                            |
-| **Repository Layer**          | `common/repositories.py`           | Complete | DocumentRepository, MetricsRepository, etc.  |
-| SQLite Storage                      | `common/database.py`               | Complete | Context manager, thread-safe                 |
-| QdrantManager                       | `common/qdrant_manager.py`         | Complete | Unified Qdrant interface                     |
-| Domain Models                       | `common/models.py`                 | Complete | Type-safe dataclasses                        |
-| **UMAP Mapping Package**      | `mapping/`                         | Complete | Protocol-based, swappable components         |
-| MappingPipeline                     | `mapping/pipeline.py`              | Complete | Orchestrates projection + clustering         |
-| Web Visualizer                      | `visualizer/server.py`             | Complete | Interactive canvas with pan/zoom             |
-| Health Monitor                      | `monitor/health.py`                | Complete | Gini, quality distribution, alerts           |
-| Structured Logging                  | `common/logging/logger.py`         | Complete | JSON logs to `logs/`                       |
-
-### Not Yet Implemented (Phase 2)
-
-| Component              | Guide Section | Notes                          |
-| ---------------------- | ------------- | ------------------------------ |
-| Active Exploration     | §4           | Gap detection, query synthesis |
-| Golden Set Calibration | §3.4         | Weight training from exemplars |
-| FPS Sampling           | §3.3         | Quality-weighted selection     |
-| Hyperbolic Projection  | §6.3.5       | Hierarchical visualization     |
-| Wayback Fallback       | §3.1.4       | Dead link recovery             |
-
-### Architecture Deviations (v1.1)
-
-| Guide Specification               | Actual Implementation                         | Rationale                                 |
-| --------------------------------- | --------------------------------------------- | ----------------------------------------- |
-| Single-stage pipeline             | Two-stage (ingest + post-process)             | 10x writer throughput, re-scorable corpus |
-| Scoring in writer                 | Deferred to PostProcessor                     | Separation of concerns, flexibility       |
-| Thread-based workers              | Async fetcher + multiprocess extraction       | Better I/O saturation + CPU utilization   |
-| CLI commands (`./batch-sample`) | Python scripts (`scripts/batch_process.py`) | Simpler development workflow              |
-| YAML configs                      | JSON config (`config.json`)                 | Native Python support                     |
-| Raw HTML archival                 | Extract-first (text only)                     | 5x storage reduction per guide v0.6       |
-| Direct SQL queries                | Repository pattern                            | Type safety, testability, maintainability |
-| Monolithic scoring                | Modular scoring package                       | Extensibility, protocol-based design      |
-
-### Key Implementation Details (v1.1)
-
-#### Two-Stage Architecture
-
-```python
-# Stage 1: Batch ingestion (scripts/batch_process.py)
-- AsyncFetcher: aiohttp event loop, 100 concurrent connections
-- ExtractPool: ProcessPoolExecutor with 8 workers
-- ConcurrentEmbedder: GPU batching with OOM protection
-- Writer: Store-only path, quality_profile_used='pending'
-
-# Stage 2: Post-processing (scripts/post_process.py)
-- PostProcessor: Batch scoring from document_texts table
-- Deferred: Content type detection, quality scoring, Wilson score
-- Optional: FPS selection, deduplication
-- Updates: quality_score, detected_content_type, status
-```
-
-#### Async HTTP Fetching
-
-```python
-# AsyncFetcher in worker.py
-- aiohttp.ClientSession for HTTP (100 concurrent)
-- playwright.async_api for JS-heavy sites (4 concurrent)
-- Exponential backoff on failures
-- Graceful shutdown with queue draining
-```
-
-#### Multiprocess Extraction
-
-```python
-# ExtractPool in worker.py
-- ProcessPoolExecutor saturates CPU cores
-- Module-level _extract_worker_fn for pickling compatibility
-- Trafilatura + readability fallback
-- Per-process stats tracking
-```
-
-#### Repository Pattern
-
-```python
-# common/repositories.py
-- DocumentRepository: Type-safe document operations
-- DocumentTextRepository: Deferred scoring text storage
-- MetricsRepository: Coverage metrics and monitoring
-- Each method opens/closes own connection (thread-safe)
-- Optional conn parameter for transactions
-```
-
-#### Protocol-Based Scoring
-
-```python
-# curation/scoring/
-- ScoringMetric protocol: Extensible metric system
-- ScoreAggregator protocol: Pluggable aggregation
-- MetricRegistry: Runtime metric discovery
-- Content-type-specific weight profiles
-- Backward compatible via _compat.py facade
-```
-
-#### Thread-Safe Database Access
-
-```python
-# database.py
-- Absolute path resolution (avoids CWD issues)
-- Context manager for transactions with auto-commit/rollback
-- Repository pattern prevents connection leaks
-```
-
-#### Interactive Visualizer
-
-```
-Features implemented:
-- Canvas-based 2D rendering (not SVG/DOM)
-- Scroll-to-zoom, drag-to-pan
-- Intra-cluster connection lines
-- Click-to-open website
-- Rich tooltips with excerpt
-- Cluster/quality filtering
-```
-
-### Configuration (`config.json`)
-
-Key sections added beyond the guide:
-
-```json
-{
-  "batch_processing": {
-    "workers": 4,
-    "worker_batch_size": 10,
-    "url_queue_size": 1000,
-    "embed_queue_size": 500
-  },
-  "mapping": {
-    "umap": { "n_neighbors": 15, "min_dist": 0.1 },
-    "hdbscan": { "min_cluster_size": 15 }
-  },
-  "visualizer": {
-    "host": "0.0.0.0",
-    "port": 8080
-  }
-}
-```
-
-### Module Documentation
-
-Each module contains a `README.md` with:
-
-- Architecture diagrams
-- Key classes and functions
-- Configuration options
-- Usage examples
-
-See individual directories for details.
+| Original Specification  | Actual Implementation                   | Rationale                         |
+| ----------------------- | --------------------------------------- | --------------------------------- |
+| Single-stage pipeline   | Two-stage (ingest + post-process)       | 10x throughput, re-scorable       |
+| CPU scoring loops       | GPU tensor dot product (planned)        | Orders of magnitude faster        |
+| SimHash/MinHash (CPU)   | GPU gram matrix cosine (planned)        | Batch dedup on entire corpus      |
+| bge-small (384D, 512tok)| nomic-embed-text-v1.5 (768D, 8192tok)  | Full essays without truncation    |
+| JSON viz export         | Arrow binary blob (planned)             | Zero-copy to WebGL                |
+| Flat relational model   | Hypergraph incidence matrix (planned)   | Multi-identity, efficient queries |
 
 ---
 
-## Appendix E: Cartographic Techniques Summary
+## Appendix D: Cartographic Techniques
 
-This version integrates five key techniques from geospatial science:
-
-| Technique          | Origin                             | Application               | Benefit                                                |
-| ------------------ | ---------------------------------- | ------------------------- | ------------------------------------------------------ |
-| Topic-cluster CV   | Spatial cross-validation           | Golden Set calibration    | Prevents 28-40% accuracy overestimate                  |
-| QADI metrics       | ISO 19157 validation               | Verification diagnostics  | Separates quantity from allocation errors              |
-| Wilson score       | Binomial confidence intervals      | Hidden gem ranking        | Sample-size-aware quality confidence                   |
-| HDBSCAN clustering | Spatial clustering (DBSCAN family) | Quality topology analysis | Finds content farms, authority clusters, orphaned gems |
-| Gini coefficient   | Geographic equity metrics          | Coverage monitoring       | Tracks topic/domain balance                            |
-
-These techniques are battle-tested on global-scale mapping challenges (OpenStreetMap, humanitarian mapping) and translate directly to web content curation.
+| Technique          | Application               | Benefit                                    |
+| ------------------ | ------------------------- | ------------------------------------------ |
+| Topic-cluster CV   | Golden Set calibration    | Prevents 28-40% accuracy overestimate      |
+| QADI metrics       | Verification diagnostics  | Separates quantity from allocation errors   |
+| Wilson score       | Hidden gem ranking        | Sample-size-aware quality confidence        |
+| HDBSCAN clustering | Quality topology analysis | Content farms, authority clusters, orphans  |
+| Gini coefficient   | Coverage monitoring       | Tracks topic/domain balance                |

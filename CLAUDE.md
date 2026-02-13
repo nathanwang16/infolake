@@ -5,7 +5,7 @@ concisely record bugs and solutions in tip.md.
 
 File structure should resemble that of each phase and pipeline.
 Script execution should never touch existing database to prevent data lost.
-All script should write and utilize comprehensive and concise logging modules at src/logging/
+All actual implementations should try to import and make use of the atlas_core/ light, core library
 
 Do not provide default behaviors or use placeholders for any parameters or function values. Instead, if one isn't provided or passed in, raise error and log.
 Pipelines that can be applied in parallel using multi-thread or multi-worker should implement simple concurrent coding practices.

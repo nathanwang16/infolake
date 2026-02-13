@@ -25,8 +25,7 @@ from queue import Queue, Empty
 from typing import Optional, Dict, Any, List, Tuple
 import numpy as np
 
-from common.logging.logger import get_logger
-from common.config import config
+from atlas_core import config, get_logger
 
 logger = get_logger("worker")
 

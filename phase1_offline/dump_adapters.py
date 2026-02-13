@@ -29,7 +29,7 @@ except ImportError:
     ZSTD_AVAILABLE = False
     zstd = None
 
-from common.logging.logger import get_logger
+from atlas_core import get_logger
 
 logger = get_logger("dump_adapters")
 

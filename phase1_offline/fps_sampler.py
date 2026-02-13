@@ -19,7 +19,7 @@ import heapq
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Tuple, Any
-from common.logging.logger import get_logger
+from atlas_core import get_logger
 
 logger = get_logger("fps_sampler")
 

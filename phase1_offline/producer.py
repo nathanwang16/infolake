@@ -19,8 +19,7 @@ from queue import Queue
 from typing import Optional, Set, Dict, Any, List
 from urllib.parse import urlparse
 
-from common.logging.logger import get_logger
-from common.config import config
+from atlas_core import config, get_logger
 from common.database import db
 from common.models import DumpJob
 from common.repositories import JobRepository, DocumentRepository
